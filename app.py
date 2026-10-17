@@ -422,6 +422,17 @@ def decode_audio(path: Path) -> Any:
     return _resample(audio, int(stream.sample_rate or SAMPLE_RATE), SAMPLE_RATE)
 
 
+def voice_cache_is_current(cache_path: Path, manifest_path: Path, digest: str) -> bool:
+    """True when the cached voice state was built from the same reference audio."""
+    if not cache_path.is_file() or not manifest_path.is_file():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return manifest.get("sha256_reference") == digest
+
+
 class WhisperRunner:
     def __init__(self, model_name: str = DEFAULT_STT):
         self.model_name = model_name
@@ -496,11 +507,9 @@ class PocketRunner:
 
     def _load_or_create_state(self, torch: Any) -> Any:
         digest = hashlib.sha256(self.reference_path.read_bytes()).hexdigest()
-        if self.cache_path.is_file() and self.manifest_path.is_file():
+        if voice_cache_is_current(self.cache_path, self.manifest_path, digest):
             try:
-                manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-                if manifest.get("sha256_reference") == digest:
-                    return torch.load(str(self.cache_path), map_location="cuda", weights_only=False)
+                return torch.load(str(self.cache_path), map_location="cuda", weights_only=False)
             except (OSError, ValueError, RuntimeError, EOFError):
                 log.warning("Voice cache is stale or corrupt; recomputing it")
         state = self.model.get_state_for_audio_prompt(str(self.reference_path))

@@ -1,3 +1,5 @@
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,6 +12,7 @@ from app import (
     chunk_text,
     decode_audio,
     stable_prefix,
+    voice_cache_is_current,
 )
 
 
@@ -119,6 +122,21 @@ class AppHelpersTests(unittest.TestCase):
         buffer.clear()
         self.assertEqual(buffer.samples, 0)
         self.assertIsNone(buffer.pop())
+
+    def test_voice_cache_current_only_when_hash_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "voice.pt"
+            manifest = root / "manifest.json"
+            cache.write_bytes(b"state")
+            manifest.write_text(json.dumps({"sha256_reference": "abc"}), encoding="utf-8")
+            self.assertTrue(voice_cache_is_current(cache, manifest, "abc"))
+            self.assertFalse(voice_cache_is_current(cache, manifest, "other"))
+            manifest.write_text("{not json", encoding="utf-8")
+            self.assertFalse(voice_cache_is_current(cache, manifest, "abc"))
+            manifest.write_text(json.dumps({"sha256_reference": "abc"}), encoding="utf-8")
+            cache.unlink()
+            self.assertFalse(voice_cache_is_current(cache, manifest, "abc"))
 
     def test_decode_audio_missing_file_raises(self):
         with self.assertRaises(FileNotFoundError):
