@@ -20,6 +20,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+# Module-level import so FastAPI can resolve the stringified `UploadFile`
+# annotation in /api/process: `from __future__ import annotations` turns
+# annotations into ForwardRefs that FastAPI resolves against module globals.
+from fastapi import UploadFile  # noqa: F401
+
 ROOT = Path(__file__).resolve().parent
 SAMPLE_RATE = 16_000
 OUTPUT_RATE = 24_000
@@ -540,27 +545,34 @@ def decode_audio(path: Path) -> Any:
 
     if not path.is_file():
         raise FileNotFoundError(f"Input audio not found: {path}")
-    container = av.open(str(path))
-    stream = next((item for item in container.streams if item.type == "audio"), None)
-    if stream is None:
-        raise ValueError(f"No audio stream found in {path.name}")
-    pieces: list[Any] = []
-    for frame in container.decode(stream):
-        array = frame.to_ndarray()
-        if np.issubdtype(array.dtype, np.integer):
-            array = array.astype(np.float32) / (float(np.iinfo(array.dtype).max) + 1.0)
-        else:
-            array = array.astype(np.float32)
-        channels = frame.layout.nb_channels
-        if frame.format.is_planar:
-            mono = array.mean(axis=0) if channels > 1 else array.reshape(-1)
-        else:
-            mono = array.reshape(-1, channels).mean(axis=1) if channels > 1 else array.reshape(-1)
-        pieces.append(mono)
-    container.close()
-    if not pieces:
-        raise ValueError(f"Audio file is empty: {path.name}")
-    audio = np.concatenate(pieces).astype(np.float32)
+    try:
+        container = av.open(str(path))
+    except av.error.FFmpegError as exc:
+        raise ValueError(f"Could not decode {path.name}: {exc}") from exc
+    try:
+        stream = next((item for item in container.streams if item.type == "audio"), None)
+        if stream is None:
+            raise ValueError(f"No audio stream found in {path.name}")
+        pieces: list[Any] = []
+        for frame in container.decode(stream):
+            array = frame.to_ndarray()
+            if np.issubdtype(array.dtype, np.integer):
+                array = array.astype(np.float32) / (float(np.iinfo(array.dtype).max) + 1.0)
+            else:
+                array = array.astype(np.float32)
+            channels = frame.layout.nb_channels
+            if frame.format.is_planar:
+                mono = array.mean(axis=0) if channels > 1 else array.reshape(-1)
+            else:
+                mono = array.reshape(-1, channels).mean(axis=1) if channels > 1 else array.reshape(-1)
+            pieces.append(mono)
+        if not pieces:
+            raise ValueError(f"Audio file is empty: {path.name}")
+        audio = np.concatenate(pieces).astype(np.float32)
+    except av.error.FFmpegError as exc:
+        raise ValueError(f"Could not decode {path.name}: {exc}") from exc
+    finally:
+        container.close()
     return _resample(audio, int(stream.sample_rate or SAMPLE_RATE), SAMPLE_RATE)
 
 
@@ -801,6 +813,10 @@ def create_web_app() -> Any:
     def index() -> Any:
         return FileResponse(ROOT / "web" / "index.html")
 
+    @web_app.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
     @web_app.get("/api/status")
     def status() -> dict[str, Any]:
         try:
@@ -867,7 +883,9 @@ def create_web_app() -> Any:
         return StreamingResponse(generate(), media_type="text/event-stream")
 
     @web_app.post("/api/process")
-    async def process(upload: UploadFile = File(...)) -> dict[str, Any]:
+    def process(upload: UploadFile = File(...)) -> dict[str, Any]:
+        # Sync (not async) on purpose: FastAPI runs it in the threadpool, so
+        # status polling and the SSE stream keep working during conversion.
         suffix = Path(upload.filename or "input.wav").suffix or ".wav"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
             shutil.copyfileobj(upload.file, temporary)
@@ -884,8 +902,17 @@ def create_web_app() -> Any:
 
 
 def main() -> None:
+    import socket
+
     import uvicorn
 
+    # One server only: on Windows SO_REUSEADDR lets a second `python app.py`
+    # bind port 8000 as well, and two servers share the same GPU (seen
+    # 2026-10-17: two Pocket TTS loads, ~0.14x real-time, interleaved logs).
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.3)
+        if probe.connect_ex(("127.0.0.1", 8000)) == 0:
+            raise SystemExit("Audio Cascader is already running on http://127.0.0.1:8000")
     uvicorn.run(create_web_app(), host="127.0.0.1", port=8000)
 
 

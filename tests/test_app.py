@@ -15,6 +15,7 @@ from app import (
     auto_convert_settings,
     cable_check_verdict,
     chunk_text,
+    create_web_app,
     decode_audio,
     device_extra_settings,
     stable_prefix,
@@ -237,6 +238,36 @@ class AppHelpersTests(unittest.TestCase):
     def test_decode_audio_missing_file_raises(self):
         with self.assertRaises(FileNotFoundError):
             decode_audio(Path("does_not_exist.wav"))
+
+
+class WebAppTests(unittest.TestCase):
+    def _client(self) -> "object":
+        from fastapi.testclient import TestClient
+
+        return TestClient(create_web_app())
+
+    def test_health_endpoint(self):
+        response = self._client().get("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
+
+    def test_process_upload_rejects_garbage_with_400(self):
+        # Regression: `from __future__ import annotations` stringifies the
+        # /api/process signature; FastAPI must be able to resolve UploadFile,
+        # otherwise every upload fails with a PydanticUserError 500.
+        response = self._client().post(
+            "/api/process",
+            files={"upload": ("bad.wav", b"this is not audio", "audio/wav")},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("PydanticUserError", response.text)
+
+    def test_decode_audio_garbage_file_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "bad.wav"
+            bad.write_bytes(b"this is not audio")
+            with self.assertRaises(ValueError):
+                decode_audio(bad)
 
 
 if __name__ == "__main__":
