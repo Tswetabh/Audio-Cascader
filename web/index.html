@@ -79,10 +79,19 @@
     fetch('/api/devices').then(r => r.json()).then(devices => {
       const input = document.querySelector('#input');
       const output = document.querySelector('#output');
+      let cableOption = null;
       devices.forEach(device => {
-        if (device.inputs) input.add(new Option(`${device.index}: ${device.name}`, device.index));
-        if (device.outputs) output.add(new Option(`${device.index}: ${device.name}`, device.index));
+        const label = `${device.index}: ${device.name} [${device.host_api}]`;
+        if (device.inputs) input.add(new Option(label, device.index));
+        if (device.outputs) {
+          const option = new Option(label, device.index);
+          output.add(option);
+          if (device.name.includes('CABLE Input') && (!cableOption || device.host_api === 'Windows WASAPI')) {
+            cableOption = option;
+          }
+        }
       });
+      if (cableOption) output.value = cableOption.value;
     });
 
     document.querySelector('#start').addEventListener('click', async () => {

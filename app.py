@@ -189,13 +189,41 @@ class RmsEndpointDetector:
         return []
 
 
+def auto_convert_settings(host_api_name: str) -> Any:
+    """WASAPI auto-convert settings when the host API is WASAPI, else None.
+
+    WASAPI shared-mode endpoints only accept their configured mix rate
+    (48 kHz here), while our streams run at 16 kHz (mic) and 24 kHz
+    (playback). Without auto-convert they fail with "Invalid sample rate".
+    """
+    if "WASAPI" not in host_api_name:
+        return None
+    import sounddevice as sd
+
+    return sd.WasapiSettings(auto_convert=True)
+
+
+def device_extra_settings(device: int | None, kind: str) -> Any:
+    """extra_settings needed to open a stream on `device` (None = default)."""
+    import sounddevice as sd
+
+    try:
+        info: Any = sd.query_devices(kind=kind) if device is None else sd.query_devices(device)
+        host = sd.query_hostapis(info["hostapi"])["name"]
+    except Exception:
+        return None
+    return auto_convert_settings(host)
+
+
 def list_audio_devices() -> list[dict[str, Any]]:
     import sounddevice as sd
 
+    hostapis = sd.query_hostapis()
     return [
         {
             "index": index,
             "name": device["name"],
+            "host_api": hostapis[device["hostapi"]]["name"],
             "inputs": device["max_input_channels"],
             "outputs": device["max_output_channels"],
         }
@@ -365,12 +393,25 @@ class LiveSession:
                 self.playback.push(audio[length:])
 
         self.running = True
+        # Load both models before opening streams: detector calibration then
+        # measures real ambience, and the first words spoken are never dropped
+        # while the models warm up. The silent warm-ups pay the one-time CUDA
+        # autotune (~8 s) and the first TTS decoder pass (~3 s) at Start
+        # instead of on the user's first sentence.
+        import numpy as np
+
+        get_whisper_runner(stt_model)
+        get_pocket_runner()
+        get_whisper_runner(stt_model).transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32))
+        for _ in get_pocket_runner().stream("Hi."):
+            pass
         self.input_stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             blocksize=LIVE_BLOCK_SIZE,
             channels=1,
             dtype="float32",
             device=input_device,
+            extra_settings=device_extra_settings(input_device, "input"),
             callback=on_input,
         )
         self.output_stream = sd.OutputStream(
@@ -379,6 +420,7 @@ class LiveSession:
             channels=1,
             dtype="float32",
             device=output_device,
+            extra_settings=device_extra_settings(output_device, "output"),
             callback=on_output,
         )
         self.input_stream.start()
@@ -437,7 +479,9 @@ class LiveSession:
                         new_text = tracker.update(text)
                         if new_text.strip():
                             emit(new_text)
-                    last_inference = now
+                    # Stamp after the call: a slow inference must not reopen the
+                    # interval gate immediately and thrash on tiny windows.
+                    last_inference = time.monotonic()
             except Exception as exc:
                 log.exception("Live worker failed")
                 self.hub.publish({"kind": "error", "error": str(exc)})
@@ -529,6 +573,44 @@ def voice_cache_is_current(cache_path: Path, manifest_path: Path, digest: str) -
     except (OSError, ValueError):
         return False
     return manifest.get("sha256_reference") == digest
+
+
+def align_and_score(source: Any, recorded: Any) -> dict[str, Any]:
+    """Locate `source` inside `recorded` via FFT cross-correlation.
+
+    Returns the delay of `recorded` relative to `source` in samples
+    (positive = recorded is late) and the normalized peak correlation.
+    Used by the VB-CABLE loop-back check.
+    """
+    import numpy as np
+
+    src = np.asarray(source, dtype=np.float64)
+    rec = np.asarray(recorded, dtype=np.float64)
+    if src.size == 0 or rec.size == 0:
+        raise ValueError("align_and_score needs non-empty signals")
+    src = src - src.mean()
+    rec = rec - rec.mean()
+    length = src.size + rec.size - 1
+    fft_size = 1 << max(1, (length - 1).bit_length())
+    corr = np.fft.irfft(np.fft.rfft(rec, fft_size) * np.conj(np.fft.rfft(src, fft_size)), fft_size)
+    peak = int(np.argmax(np.abs(corr)))
+    # Negative lags wrap to the tail of the circular correlation: indices
+    # [fft_size - (len(rec) - 1), fft_size) hold lags -(len(rec) - 1) .. -1.
+    if peak >= fft_size - (rec.size - 1):
+        peak -= fft_size
+    denom = float(np.sqrt(np.sum(src * src) * np.sum(rec * rec)))
+    peak_value = float(corr[peak])
+    return {
+        "lag_samples": peak,
+        "peak_correlation": peak_value / denom if denom else 0.0,
+    }
+
+
+def cable_check_verdict(peak_correlation: float, recorded_rms: float, threshold: float = 0.75) -> str:
+    """Classify the outcome of a VB-CABLE loop-back check."""
+    if recorded_rms <= 1e-5:
+        return "silent"
+    return "pass" if peak_correlation >= threshold else "mismatch"
 
 
 class WhisperRunner:

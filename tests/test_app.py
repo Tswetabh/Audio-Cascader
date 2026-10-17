@@ -11,11 +11,16 @@ from app import (
     PlaybackBuffer,
     RmsEndpointDetector,
     SessionRecorder,
+    align_and_score,
+    auto_convert_settings,
+    cable_check_verdict,
     chunk_text,
     decode_audio,
+    device_extra_settings,
     stable_prefix,
     voice_cache_is_current,
 )
+from unittest import mock
 
 
 class AppHelpersTests(unittest.TestCase):
@@ -175,6 +180,59 @@ class AppHelpersTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result = SessionRecorder().finalize(Path(tmp), 24000)
             self.assertTrue(Path(result["metrics"]).is_file())
+
+    def test_align_and_score_identical_signals(self):
+        signal = np.random.default_rng(7).standard_normal(4800).astype(np.float32)
+        score = align_and_score(signal, signal.copy())
+        self.assertEqual(score["lag_samples"], 0)
+        self.assertGreater(score["peak_correlation"], 0.99)
+
+    def test_align_and_score_detects_delay_and_tolerates_scale(self):
+        signal = np.random.default_rng(7).standard_normal(4800).astype(np.float32)
+        recorded = np.concatenate([np.zeros(240, dtype=np.float32), signal * 0.5])
+        score = align_and_score(signal, recorded)
+        self.assertEqual(score["lag_samples"], 240)
+        self.assertGreater(score["peak_correlation"], 0.99)
+
+    def test_align_and_score_advanced_signal_reports_negative_lag(self):
+        signal = np.random.default_rng(7).standard_normal(4800).astype(np.float32)
+        recorded = np.concatenate([signal[240:], np.zeros(240, dtype=np.float32)])
+        score = align_and_score(signal, recorded)
+        self.assertEqual(score["lag_samples"], -240)
+
+    def test_align_and_score_silence_has_zero_correlation(self):
+        signal = np.random.default_rng(7).standard_normal(4800).astype(np.float32)
+        score = align_and_score(signal, np.zeros(4800, dtype=np.float32))
+        self.assertEqual(score["peak_correlation"], 0.0)
+
+    def test_cable_check_verdict_branches(self):
+        self.assertEqual(cable_check_verdict(0.95, 0.2), "pass")
+        self.assertEqual(cable_check_verdict(0.0, 0.0), "silent")
+        self.assertEqual(cable_check_verdict(0.3, 0.2), "mismatch")
+
+    def test_auto_convert_settings_only_for_wasapi_hosts(self):
+        self.assertIsNone(auto_convert_settings("MME"))
+        self.assertIsNone(auto_convert_settings("Windows DirectSound"))
+        settings = auto_convert_settings("Windows WASAPI")
+        self.assertIsNotNone(settings)
+        self.assertNotEqual(settings._streaminfo.flags, 0)
+
+    def test_device_extra_settings_picks_wasapi_auto_convert(self):
+        hostapis = [{"name": "MME"}, {"name": "Windows DirectSound"}, {"name": "Windows WASAPI"}]
+        # Indexed WASAPI device -> auto-convert settings; non-WASAPI -> None.
+        with mock.patch("sounddevice.query_devices", return_value={"name": "CABLE Input", "hostapi": 2}), \
+             mock.patch("sounddevice.query_hostapis", side_effect=lambda index=None: hostapis if index is None else hostapis[index]):
+            self.assertIsNotNone(device_extra_settings(19, "output"))
+        with mock.patch("sounddevice.query_devices", return_value={"name": "Speakers", "hostapi": 0}), \
+             mock.patch("sounddevice.query_hostapis", side_effect=lambda index=None: hostapis if index is None else hostapis[index]):
+            self.assertIsNone(device_extra_settings(5, "output"))
+
+    def test_device_extra_settings_default_device_uses_kind(self):
+        hostapis = [{"name": "Windows WASAPI"}]
+        with mock.patch("sounddevice.query_devices", return_value={"name": "Default Mic", "hostapi": 0}) as query, \
+             mock.patch("sounddevice.query_hostapis", side_effect=lambda index=None: hostapis if index is None else hostapis[index]):
+            self.assertIsNotNone(device_extra_settings(None, "input"))
+            query.assert_called_once_with(kind="input")
 
     def test_decode_audio_missing_file_raises(self):
         with self.assertRaises(FileNotFoundError):
