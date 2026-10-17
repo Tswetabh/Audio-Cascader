@@ -82,6 +82,7 @@ class AppHelpersTests(unittest.TestCase):
                 timings={"stt_latency_ms": 80.0},
             )
         )
+        session.update_segment_diagnostics(1, "timings", {"end_to_end_latency_ms": 123.0})
 
         snapshot = session.diagnostics_snapshot()
 
@@ -89,6 +90,7 @@ class AppHelpersTests(unittest.TestCase):
         self.assertEqual(snapshot["counters"]["segment_count"], 1)
         self.assertEqual(snapshot["counters"]["input_queue_drops"], 3)
         self.assertEqual(snapshot["segments"][0]["timings"]["stt_latency_ms"], 80.0)
+        self.assertEqual(snapshot["segments"][0]["timings"]["end_to_end_latency_ms"], 123.0)
 
     def test_system_sample_has_stable_cpu_memory_and_gpu_fields(self):
         sample = sample_system_usage()

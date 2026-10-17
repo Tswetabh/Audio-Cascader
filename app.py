@@ -548,6 +548,15 @@ class LiveSession:
                 return 0.0
             return time.monotonic() - self.diagnostics.started_at
 
+    def segment_started_at(self, segment_id: int) -> float | None:
+        with self._diagnostics_lock:
+            if self.diagnostics is None:
+                return None
+            for segment in self.diagnostics.segments:
+                if segment.segment_id == segment_id:
+                    return segment.started_at
+        return None
+
     def add_system_sample(self, sample: dict[str, Any]) -> None:
         with self._diagnostics_lock:
             if self.diagnostics is not None:
@@ -717,6 +726,10 @@ class LiveSession:
                         {
                             "tts_first_frame_latency_ms": round(
                                 ((first_frame_at or finished_at) - queued_at) * 1000.0, 3
+                            ),
+                            "end_to_end_latency_ms": round(
+                                (finished_at - (self.segment_started_at(segment_id) or finished_at)) * 1000.0,
+                                3,
                             ),
                         },
                     )
