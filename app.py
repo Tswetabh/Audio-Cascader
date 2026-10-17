@@ -121,9 +121,9 @@ class RmsEndpointDetector:
         sample_rate: int = SAMPLE_RATE,
         block_size: int = 512,
         threshold: float = 0.02,
-        silence_ms: int = 300,
-        min_speech_ms: int = 200,
-        max_segment_ms: int = 3500,
+        silence_ms: int = 500,
+        min_speech_ms: int = 300,
+        max_segment_ms: int = 5000,
         calibrate_ms: int = 2000,
     ):
         self.sample_rate = sample_rate

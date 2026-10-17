@@ -46,6 +46,11 @@ class AppHelpersTests(unittest.TestCase):
         self.assertEqual(len(emitted), 1)
         self.assertEqual(len(emitted[0]), 300)
 
+    def test_live_endpoint_defaults_keep_natural_pauses_in_one_segment(self):
+        detector = RmsEndpointDetector(sample_rate=1000, block_size=100, calibrate_ms=0)
+        self.assertEqual(detector.silence_blocks, 5)
+        self.assertEqual(detector.max_samples, 5000)
+
     def test_calibrated_threshold_rejects_ambient_then_detects_speech(self):
         detector = RmsEndpointDetector(
             sample_rate=1000, block_size=100, silence_ms=200, min_speech_ms=100, calibrate_ms=500
