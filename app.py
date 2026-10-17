@@ -1149,14 +1149,27 @@ def process_file(input_path: Path, output_dir: Path | None = None, model_name: s
 
 def create_web_app() -> Any:
     from fastapi import FastAPI, File, HTTPException, UploadFile
-    from fastapi.responses import FileResponse, Response
+    from fastapi.responses import FileResponse, PlainTextResponse, Response
+    from fastapi.staticfiles import StaticFiles
 
     web_app = FastAPI(title="Audio Cascader")
     session = LiveSession()
 
-    @web_app.get("/")
-    def index() -> Any:
-        return FileResponse(ROOT / "web" / "index.html")
+    frontend_dist = ROOT / "web" / "dist"
+    if frontend_dist.is_dir() and (frontend_dist / "index.html").is_file():
+        web_app.mount("/assets", StaticFiles(directory=frontend_dist / "assets"), name="assets")
+
+        @web_app.get("/")
+        def index() -> Any:
+            return FileResponse(frontend_dist / "index.html")
+    else:
+
+        @web_app.get("/")
+        def index() -> Any:
+            return PlainTextResponse(
+                "React frontend is not built. Run `npm install` and `npm run build` in web/.",
+                status_code=503,
+            )
 
     @web_app.get("/health")
     def health() -> dict[str, str]:

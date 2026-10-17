@@ -342,6 +342,20 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
 
+    def test_react_frontend_serves_from_production_build(self):
+        response = self._client().get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('id="root"', response.text)
+
+    def test_missing_react_build_explains_how_to_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("app.ROOT", Path(tmp)):
+                response = self._client().get("/")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("npm run build", response.text)
+
     def test_process_upload_rejects_garbage_with_400(self):
         # Regression: `from __future__ import annotations` stringifies the
         # /api/process signature; FastAPI must be able to resolve UploadFile,
