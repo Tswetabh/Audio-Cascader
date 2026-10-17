@@ -189,22 +189,23 @@ class LiveSession:
         self.output_stream.start()
 
         def worker() -> None:
-            stt = WhisperRunner()
-            tts = PocketRunner()
+            stt = get_whisper_runner()
+            tts = get_pocket_runner()
             while self.running:
                 try:
                     block = self.input_queue.get(timeout=0.2)
                 except queue.Empty:
                     continue
                 for segment in detector.push(block):
-                    result = stt.transcribe(segment)
-                    for text in chunk_text(result["text"]):
-                        audio = tts.synthesize(text)
-                        if len(audio):
-                            try:
-                                self.playback.put(audio, timeout=0.5)
-                            except queue.Full:
-                                pass
+                    with _GPU_LOCK:
+                        result = stt.transcribe(segment)
+                        for text in chunk_text(result["text"]):
+                            audio = tts.synthesize(text)
+                            if len(audio):
+                                try:
+                                    self.playback.put(audio, timeout=0.5)
+                                except queue.Full:
+                                    pass
 
         self.worker = threading.Thread(target=worker, name="audio-cascader-live", daemon=True)
         self.worker.start()
@@ -258,8 +259,17 @@ def decode_audio(path: Path) -> Any:
         raise ValueError(f"No audio stream found in {path.name}")
     pieces: list[Any] = []
     for frame in container.decode(stream):
-        array = frame.to_ndarray(format="fltp")
-        pieces.append(array.mean(axis=0) if array.ndim > 1 else array)
+        array = frame.to_ndarray()
+        if np.issubdtype(array.dtype, np.integer):
+            array = array.astype(np.float32) / (float(np.iinfo(array.dtype).max) + 1.0)
+        else:
+            array = array.astype(np.float32)
+        channels = frame.layout.nb_channels
+        if frame.format.is_planar:
+            mono = array.mean(axis=0) if channels > 1 else array.reshape(-1)
+        else:
+            mono = array.reshape(-1, channels).mean(axis=1) if channels > 1 else array.reshape(-1)
+        pieces.append(mono)
     container.close()
     if not pieces:
         raise ValueError(f"Audio file is empty: {path.name}")
@@ -379,6 +389,28 @@ class PocketRunner:
         return audio
 
 
+_GPU_LOCK = threading.RLock()
+_stt_runners: dict[str, WhisperRunner] = {}
+_tts_runner: PocketRunner | None = None
+
+
+def get_whisper_runner(model_name: str = DEFAULT_STT) -> WhisperRunner:
+    """Return the shared Whisper runner for a model name (models load lazily)."""
+    with _GPU_LOCK:
+        if model_name not in _stt_runners:
+            _stt_runners[model_name] = WhisperRunner(model_name)
+        return _stt_runners[model_name]
+
+
+def get_pocket_runner() -> PocketRunner:
+    """Return the shared Pocket TTS runner (model loads lazily)."""
+    global _tts_runner
+    with _GPU_LOCK:
+        if _tts_runner is None:
+            _tts_runner = PocketRunner()
+        return _tts_runner
+
+
 def process_file(input_path: Path, output_dir: Path | None = None, model_name: str = DEFAULT_STT) -> dict[str, Any]:
     """Run one file through STT → chunking → TTS and save reproducible artifacts."""
     import numpy as np
@@ -388,11 +420,11 @@ def process_file(input_path: Path, output_dir: Path | None = None, model_name: s
     output_dir.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
     audio = decode_audio(input_path)
-    stt = WhisperRunner(model_name)
-    transcript = stt.transcribe(audio)
-    texts = chunk_text(transcript["text"])
-    tts = PocketRunner()
-    rendered = [tts.synthesize(text) for text in texts]
+    with _GPU_LOCK:
+        transcript = get_whisper_runner(model_name).transcribe(audio)
+        texts = chunk_text(transcript["text"])
+        tts = get_pocket_runner()
+        rendered = [tts.synthesize(text) for text in texts]
     output = np.concatenate(rendered) if rendered else np.zeros(0, dtype=np.float32)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = output_dir / f"converted_{stamp}.wav"

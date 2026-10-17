@@ -15,9 +15,9 @@ weights/
 # Generated / cached audio
 outputs/
 *_16k.wav
-# Local voice cache (rebuilds from references/ on first run)
-# Cached voice state (rebuilds from the reference WAV on first run)
+# Local voice cache (rebuilds from voices/american_accent.wav on first run)
 voices/*.pt
+voices/manifest.json
 # Audio / secrets
 .env
 # OS / IDE

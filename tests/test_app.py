@@ -1,8 +1,9 @@
 import unittest
+from pathlib import Path
 
 import numpy as np
 
-from app import RmsEndpointDetector, chunk_text, stable_prefix
+from app import RmsEndpointDetector, chunk_text, decode_audio, stable_prefix
 
 
 class AppHelpersTests(unittest.TestCase):
@@ -24,6 +25,10 @@ class AppHelpersTests(unittest.TestCase):
         emitted = detector.push(np.zeros(100, dtype=np.float32))
         self.assertEqual(len(emitted), 1)
         self.assertEqual(len(emitted[0]), 300)
+
+    def test_decode_audio_missing_file_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            decode_audio(Path("does_not_exist.wav"))
 
 
 if __name__ == "__main__":
