@@ -353,6 +353,32 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertNotIn("PydanticUserError", response.text)
 
+    def test_diagnostics_endpoint_returns_empty_snapshot(self):
+        response = self._client().get("/api/diagnostics")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["segments"], [])
+        self.assertIn("summary", response.json())
+
+    def test_diagnostics_json_export_is_an_explicit_download(self):
+        response = self._client().get("/api/diagnostics/export?format=json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("attachment", response.headers["content-disposition"])
+        self.assertEqual(response.json()["segments"], [])
+
+    def test_diagnostics_csv_export_has_stable_headers(self):
+        response = self._client().get("/api/diagnostics/export?format=csv")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("segment_id", response.text.splitlines()[0])
+        self.assertIn("attachment", response.headers["content-disposition"])
+
+    def test_diagnostics_export_rejects_unknown_format(self):
+        response = self._client().get("/api/diagnostics/export?format=xml")
+
+        self.assertEqual(response.status_code, 400)
+
     def test_decode_audio_garbage_file_raises_value_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             bad = Path(tmp) / "bad.wav"

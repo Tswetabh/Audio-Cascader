@@ -7,6 +7,8 @@ be tested without allocating GPU memory.  Neural inference is CUDA-only.
 from __future__ import annotations
 
 import hashlib
+import csv
+import io
 import json
 import logging
 import os
@@ -1147,7 +1149,7 @@ def process_file(input_path: Path, output_dir: Path | None = None, model_name: s
 
 def create_web_app() -> Any:
     from fastapi import FastAPI, File, HTTPException, UploadFile
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, Response
 
     web_app = FastAPI(title="Audio Cascader")
     session = LiveSession()
@@ -1179,6 +1181,67 @@ def create_web_app() -> Any:
             "playback_underruns": session.playback_underruns,
             "recording": session.last_recording,
         }
+
+    @web_app.get("/api/diagnostics")
+    def diagnostics() -> dict[str, Any]:
+        return session.diagnostics_snapshot()
+
+    @web_app.get("/api/diagnostics/export")
+    def export_diagnostics(format: str = "json") -> Response:
+        snapshot = session.diagnostics_snapshot()
+        if format == "json":
+            return Response(
+                content=json.dumps(snapshot, indent=2),
+                media_type="application/json",
+                headers={"Content-Disposition": "attachment; filename=audio-cascader-diagnostics.json"},
+            )
+        if format == "csv":
+            fields = [
+                "segment_id",
+                "started_at",
+                "ended_at",
+                "audio_duration_s",
+                "rms",
+                "peak",
+                "stt_text",
+                "stt_latency_ms",
+                "tts_queue_wait_ms",
+                "tts_first_frame_latency_ms",
+                "tts_generation_ms",
+                "tts_real_time_factor",
+                "end_to_end_latency_ms",
+                "error",
+            ]
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=fields)
+            writer.writeheader()
+            for segment in snapshot["segments"]:
+                writer.writerow(
+                    {
+                        "segment_id": segment["segment_id"],
+                        "started_at": segment["started_at"],
+                        "ended_at": segment["ended_at"],
+                        "audio_duration_s": segment["audio_duration_s"],
+                        "rms": segment["rms"],
+                        "peak": segment["peak"],
+                        "stt_text": segment.get("stt", {}).get("text", ""),
+                        "stt_latency_ms": segment.get("stt", {}).get("latency_ms", ""),
+                        "tts_queue_wait_ms": segment.get("tts", {}).get("queue_wait_ms", ""),
+                        "tts_first_frame_latency_ms": segment.get("timings", {}).get(
+                            "tts_first_frame_latency_ms", ""
+                        ),
+                        "tts_generation_ms": segment.get("tts", {}).get("generation_ms", ""),
+                        "tts_real_time_factor": segment.get("tts", {}).get("real_time_factor", ""),
+                        "end_to_end_latency_ms": segment.get("timings", {}).get("end_to_end_latency_ms", ""),
+                        "error": segment.get("error", "") or "",
+                    }
+                )
+            return Response(
+                content=output.getvalue(),
+                media_type="text/csv",
+                headers={"Content-Disposition": "attachment; filename=audio-cascader-diagnostics.csv"},
+            )
+        raise HTTPException(status_code=400, detail="format must be json or csv")
 
     @web_app.get("/api/devices")
     def devices() -> list[dict[str, Any]]:
