@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Audio Cascader</title>
+  <style>
+    body { max-width: 720px; margin: 3rem auto; padding: 0 1rem; font: 16px system-ui, sans-serif; }
+    button { padding: .6rem 1rem; cursor: pointer; }
+    pre { background: #f1f3f5; padding: 1rem; overflow: auto; }
+    #result { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Audio Cascader</h1>
+  <p id="status">Checking CUDA status…</p>
+  <form id="form">
+    <input id="audio" type="file" accept="audio/*" required>
+    <button>Convert</button>
+  </form>
+  <pre id="result"></pre>
+  <script>
+    const status = document.querySelector('#status');
+    const result = document.querySelector('#result');
+    fetch('/api/status').then(r => r.json()).then(s => {
+      status.textContent = s.gpu ? `GPU: ${s.gpu} · STT: ${s.stt_model} · TTS: ${s.tts_model}` : 'CUDA unavailable';
+    });
+    document.querySelector('#form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const data = new FormData();
+      data.append('upload', document.querySelector('#audio').files[0]);
+      result.textContent = 'Processing…';
+      const response = await fetch('/api/process', { method: 'POST', body: data });
+      result.textContent = JSON.stringify(await response.json(), null, 2);
+    });
+  </script>
+</body>
+</html>

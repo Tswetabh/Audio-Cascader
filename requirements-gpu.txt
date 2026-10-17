@@ -1,0 +1,17 @@
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+numpy
+soundfile
+sounddevice
+av
+safetensors
+fastapi
+uvicorn
+python-multipart
+pyyaml
+pydantic
+sentencepiece
+beartype
+huggingface-hub
