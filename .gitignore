@@ -16,8 +16,8 @@ weights/
 outputs/
 *_16k.wav
 # Local voice cache (rebuilds from references/ on first run)
-# Uncomment to also exclude the 49MB cached voice state:
-# embeddings/
+# Cached voice state (rebuilds from the reference WAV on first run)
+voices/*.pt
 # Audio / secrets
 .env
 # OS / IDE
