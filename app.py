@@ -27,6 +27,7 @@ DEFAULT_STT = "turbo"
 INCREMENTAL_INTERVAL_S = 0.6
 INCREMENTAL_WINDOW_S = 10.0
 LIVE_BLOCK_SIZE = 512
+PRE_ROLL_MS = 100
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("audio_cascader")
@@ -128,6 +129,7 @@ class RmsEndpointDetector:
         self._calibrate_blocks = round(calibrate_ms * sample_rate / block_size / 1000)
         self._calibration: list[float] = []
         self._calibrating = self._calibrate_blocks > 0
+        self._pre_roll: deque[Any] = deque(maxlen=max(1, round(PRE_ROLL_MS * sample_rate / block_size / 1000)))
         self._blocks: list[Any] = []
         self._samples = 0
         self._silent = 0
@@ -144,6 +146,7 @@ class RmsEndpointDetector:
         self._blocks = []
         self._samples = 0
         self._silent = 0
+        self._pre_roll.clear()
 
     def push(self, block: Any) -> list[Any]:
         import numpy as np
@@ -160,15 +163,23 @@ class RmsEndpointDetector:
                 self._calibrating = False
             return []
         active = rms >= self.threshold
-        if active or self._blocks:
+        if not self._blocks:
+            if not active:
+                self._pre_roll.append(audio)
+                return []
+            seed = list(self._pre_roll)
+            self._pre_roll.clear()
+            self._blocks = seed + [audio]
+            self._samples = sum(len(piece) for piece in seed) + len(audio)
+            self._silent = 0
+        elif active:
             self._blocks.append(audio)
             self._samples += len(audio)
-        if active:
             self._silent = 0
-        elif self._blocks:
+        else:
+            self._blocks.append(audio)
+            self._samples += len(audio)
             self._silent += 1
-        if not self._blocks:
-            return []
         if self._samples >= self.max_samples or self._silent >= self.silence_blocks:
             result = np.concatenate(self._blocks)
             self._reset()

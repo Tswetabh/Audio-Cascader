@@ -48,6 +48,18 @@ class AppHelpersTests(unittest.TestCase):
         emitted = detector.push(np.zeros(100, dtype=np.float32))
         self.assertEqual(len(emitted), 1)
 
+    def test_pre_roll_retained_before_speech(self):
+        detector = RmsEndpointDetector(
+            sample_rate=1000, block_size=100, silence_ms=200, min_speech_ms=100, calibrate_ms=0
+        )
+        detector.push(np.zeros(100, dtype=np.float32))
+        detector.push(np.zeros(100, dtype=np.float32))
+        detector.push(np.ones(100, dtype=np.float32) * 0.2)
+        detector.push(np.zeros(100, dtype=np.float32))
+        emitted = detector.push(np.zeros(100, dtype=np.float32))
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(len(emitted[0]), 400)
+
     def test_in_speech_reflects_open_segment(self):
         detector = RmsEndpointDetector(
             sample_rate=1000, block_size=100, silence_ms=200, min_speech_ms=100, calibrate_ms=0
