@@ -6,9 +6,11 @@ from pathlib import Path
 import numpy as np
 
 from app import (
+    EventHub,
     IncrementalTranscriber,
     PlaybackBuffer,
     RmsEndpointDetector,
+    SessionRecorder,
     chunk_text,
     decode_audio,
     stable_prefix,
@@ -137,6 +139,42 @@ class AppHelpersTests(unittest.TestCase):
             manifest.write_text(json.dumps({"sha256_reference": "abc"}), encoding="utf-8")
             cache.unlink()
             self.assertFalse(voice_cache_is_current(cache, manifest, "abc"))
+
+    def test_event_hub_fans_out_and_unsubscribes(self):
+        hub = EventHub()
+        first = hub.subscribe()
+        second = hub.subscribe()
+        hub.publish({"kind": "state", "state": "running"})
+        self.assertEqual(first.get_nowait()["state"], "running")
+        self.assertEqual(second.get_nowait()["state"], "running")
+        hub.unsubscribe(second)
+        hub.publish({"kind": "state", "state": "ready"})
+        self.assertEqual(first.get_nowait()["state"], "ready")
+        self.assertTrue(second.empty())
+
+    def test_session_recorder_writes_wav_and_metrics(self):
+        import soundfile as sf
+
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = SessionRecorder()
+            recorder.add_audio(np.zeros(2400, dtype=np.float32))
+            recorder.add_audio(np.ones(2400, dtype=np.float32) * 0.5)
+            recorder.add_event("spoken", "hello world")
+            recorder.add_event("converted", "hello world")
+            result = recorder.finalize(Path(tmp), 24000)
+            self.assertTrue(Path(result["wav"]).is_file())
+            self.assertTrue(Path(result["metrics"]).is_file())
+            self.assertAlmostEqual(result["duration_s"], 0.2, places=3)
+            payload = json.loads(Path(result["metrics"]).read_text(encoding="utf-8"))
+            self.assertEqual([event["kind"] for event in payload["events"]], ["spoken", "converted"])
+            audio, rate = sf.read(result["wav"])
+            self.assertEqual(rate, 24000)
+            self.assertEqual(len(audio), 4800)
+
+    def test_session_recorder_handles_empty_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = SessionRecorder().finalize(Path(tmp), 24000)
+            self.assertTrue(Path(result["metrics"]).is_file())
 
     def test_decode_audio_missing_file_raises(self):
         with self.assertRaises(FileNotFoundError):
