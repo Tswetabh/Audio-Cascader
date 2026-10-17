@@ -12,6 +12,8 @@ import logging
 import re
 import shutil
 import tempfile
+import threading
+import queue
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -57,6 +59,170 @@ def stable_prefix(previous: str, current: str) -> str:
             break
         common.append(left)
     return " ".join(common)
+
+
+class RmsEndpointDetector:
+    """Small non-neural speech endpoint detector for fixed-size audio blocks."""
+
+    def __init__(
+        self,
+        sample_rate: int = SAMPLE_RATE,
+        block_size: int = 512,
+        threshold: float = 0.02,
+        silence_ms: int = 300,
+        min_speech_ms: int = 200,
+        max_segment_ms: int = 3500,
+    ):
+        self.sample_rate = sample_rate
+        self.block_size = block_size
+        self.threshold = threshold
+        self.silence_blocks = max(1, round(silence_ms * sample_rate / block_size / 1000))
+        self.min_samples = round(min_speech_ms * sample_rate / 1000)
+        self.max_samples = round(max_segment_ms * sample_rate / 1000)
+        self._blocks: list[Any] = []
+        self._samples = 0
+        self._silent = 0
+
+    def _reset(self) -> None:
+        self._blocks = []
+        self._samples = 0
+        self._silent = 0
+
+    def push(self, block: Any) -> list[Any]:
+        import numpy as np
+
+        audio = np.asarray(block, dtype=np.float32).reshape(-1)
+        if not len(audio):
+            return []
+        rms = float(np.sqrt(np.mean(np.square(audio))))
+        active = rms >= self.threshold
+        if active or self._blocks:
+            self._blocks.append(audio)
+            self._samples += len(audio)
+        if active:
+            self._silent = 0
+        elif self._blocks:
+            self._silent += 1
+        if not self._blocks:
+            return []
+        if self._samples >= self.max_samples or self._silent >= self.silence_blocks:
+            result = np.concatenate(self._blocks)
+            self._reset()
+            if len(result) >= self.min_samples:
+                return [result]
+        return []
+
+
+def list_audio_devices() -> list[dict[str, Any]]:
+    import sounddevice as sd
+
+    return [
+        {
+            "index": index,
+            "name": device["name"],
+            "inputs": device["max_input_channels"],
+            "outputs": device["max_output_channels"],
+        }
+        for index, device in enumerate(sd.query_devices())
+        if device["max_input_channels"] or device["max_output_channels"]
+    ]
+
+
+class LiveSession:
+    """Capture microphone blocks, endpoint them, and play converted segments."""
+
+    def __init__(self):
+        self.running = False
+        self.input_queue: queue.Queue[Any] = queue.Queue(maxsize=64)
+        self.playback: queue.Queue[Any] = queue.Queue(maxsize=16)
+        self.dropped_blocks = 0
+        self.input_stream: Any = None
+        self.output_stream: Any = None
+        self.worker: threading.Thread | None = None
+
+    def start(self, input_device: int | None = None, output_device: int | None = None) -> None:
+        import sounddevice as sd
+
+        if self.running:
+            return
+        require_cuda()
+        detector = RmsEndpointDetector()
+
+        def on_input(indata: Any, _frames: int, _timing: Any, _status: Any) -> None:
+            try:
+                self.input_queue.put_nowait(indata[:, 0].copy())
+            except queue.Full:
+                self.dropped_blocks += 1
+
+        def on_output(outdata: Any, _frames: int, _timing: Any, _status: Any) -> None:
+            outdata.fill(0)
+            try:
+                audio = self.playback.get_nowait()
+            except queue.Empty:
+                return
+            length = min(len(audio), len(outdata))
+            outdata[:length, 0] = audio[:length]
+            if length < len(audio):
+                try:
+                    self.playback.put_nowait(audio[length:])
+                except queue.Full:
+                    pass
+
+        self.running = True
+        self.input_stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=512,
+            channels=1,
+            dtype="float32",
+            device=input_device,
+            callback=on_input,
+        )
+        self.output_stream = sd.OutputStream(
+            samplerate=OUTPUT_RATE,
+            blocksize=512,
+            channels=1,
+            dtype="float32",
+            device=output_device,
+            callback=on_output,
+        )
+        self.input_stream.start()
+        self.output_stream.start()
+
+        def worker() -> None:
+            stt = WhisperRunner()
+            tts = PocketRunner()
+            while self.running:
+                try:
+                    block = self.input_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                for segment in detector.push(block):
+                    result = stt.transcribe(segment)
+                    for text in chunk_text(result["text"]):
+                        audio = tts.synthesize(text)
+                        if len(audio):
+                            try:
+                                self.playback.put(audio, timeout=0.5)
+                            except queue.Full:
+                                pass
+
+        self.worker = threading.Thread(target=worker, name="audio-cascader-live", daemon=True)
+        self.worker.start()
+
+    def stop(self) -> None:
+        self.running = False
+        if self.input_stream is not None:
+            self.input_stream.stop()
+            self.input_stream.close()
+        if self.output_stream is not None:
+            self.output_stream.stop()
+            self.output_stream.close()
+        self.input_stream = None
+        self.output_stream = None
+        while not self.input_queue.empty():
+            self.input_queue.get_nowait()
+        while not self.playback.empty():
+            self.playback.get_nowait()
 
 
 def require_cuda() -> str:
@@ -250,6 +416,7 @@ def create_web_app() -> Any:
     from fastapi.responses import FileResponse
 
     web_app = FastAPI(title="Audio Cascader")
+    session = LiveSession()
 
     @web_app.get("/")
     def index() -> Any:
@@ -263,7 +430,34 @@ def create_web_app() -> Any:
             gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
         except ImportError:
             gpu = None
-        return {"gpu": gpu, "stt_model": DEFAULT_STT, "tts_model": "pocket_tts", "state": "ready"}
+        return {
+            "gpu": gpu,
+            "stt_model": DEFAULT_STT,
+            "tts_model": "pocket_tts",
+            "state": "running" if session.running else "ready",
+            "queue_drops": session.dropped_blocks,
+        }
+
+    @web_app.get("/api/devices")
+    def devices() -> list[dict[str, Any]]:
+        try:
+            return list_audio_devices()
+        except (ImportError, RuntimeError) as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @web_app.post("/api/start")
+    def start(input_device: int | None = None, output_device: int | None = None) -> dict[str, Any]:
+        try:
+            session.start(input_device=input_device, output_device=output_device)
+            return {"state": "running"}
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            session.stop()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @web_app.post("/api/stop")
+    def stop() -> dict[str, Any]:
+        session.stop()
+        return {"state": "ready"}
 
     @web_app.post("/api/process")
     async def process(upload: UploadFile = File(...)) -> dict[str, Any]:

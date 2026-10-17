@@ -14,6 +14,13 @@
 <body>
   <h1>Audio Cascader</h1>
   <p id="status">Checking CUDA status…</p>
+  <section>
+    <label>Microphone <select id="input"></select></label>
+    <label>Output <select id="output"></select></label>
+    <button id="start" type="button">Start live</button>
+    <button id="stop" type="button">Stop</button>
+  </section>
+  <hr>
   <form id="form">
     <input id="audio" type="file" accept="audio/*" required>
     <button>Convert</button>
@@ -24,6 +31,24 @@
     const result = document.querySelector('#result');
     fetch('/api/status').then(r => r.json()).then(s => {
       status.textContent = s.gpu ? `GPU: ${s.gpu} · STT: ${s.stt_model} · TTS: ${s.tts_model}` : 'CUDA unavailable';
+    });
+    fetch('/api/devices').then(r => r.json()).then(devices => {
+      const input = document.querySelector('#input');
+      const output = document.querySelector('#output');
+      devices.forEach(device => {
+        if (device.inputs) input.add(new Option(`${device.index}: ${device.name}`, device.index));
+        if (device.outputs) output.add(new Option(`${device.index}: ${device.name}`, device.index));
+      });
+    });
+    document.querySelector('#start').addEventListener('click', async () => {
+      const input = document.querySelector('#input').value;
+      const output = document.querySelector('#output').value;
+      const response = await fetch(`/api/start?input_device=${input}&output_device=${output}`, { method: 'POST' });
+      result.textContent = JSON.stringify(await response.json(), null, 2);
+    });
+    document.querySelector('#stop').addEventListener('click', async () => {
+      const response = await fetch('/api/stop', { method: 'POST' });
+      result.textContent = JSON.stringify(await response.json(), null, 2);
     });
     document.querySelector('#form').addEventListener('submit', async event => {
       event.preventDefault();
