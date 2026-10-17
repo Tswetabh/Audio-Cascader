@@ -1,0 +1,41 @@
+:root {
+  color: #e9eef5;
+  background: #10151d;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+button, select { font: inherit; }
+button { cursor: pointer; }
+
+.app-shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 34px 0 64px; }
+.topbar, .panel-heading, .actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.topbar { margin-bottom: 24px; }
+h1, h2, p { margin: 0; }
+h1 { font-size: clamp(1.8rem, 4vw, 2.8rem); letter-spacing: -.04em; }
+h2 { font-size: 1rem; letter-spacing: -.01em; }
+.eyebrow { color: #70a6ff; font-size: .68rem; font-weight: 700; letter-spacing: .14em; }
+.muted { color: #8e9aaa; font-size: .8rem; }
+.status-pill { border: 1px solid #2f9d70; color: #74e0ab; border-radius: 999px; padding: 6px 12px; font-size: .7rem; font-weight: 800; letter-spacing: .1em; }
+.panel { background: #171e28; border: 1px solid #2a3543; border-radius: 14px; padding: 20px; margin: 16px 0; box-shadow: 0 14px 40px #0002; }
+.panel-heading { margin-bottom: 18px; }
+.control-grid { display: grid; grid-template-columns: 2fr 2fr 1fr; gap: 12px; }
+label { display: grid; gap: 7px; color: #aeb9c7; font-size: .76rem; }
+select { width: 100%; background: #0f151d; color: #e9eef5; border: 1px solid #344255; border-radius: 8px; padding: 10px; }
+button { border: 0; border-radius: 8px; background: #4c8dff; color: white; padding: 10px 15px; font-weight: 700; }
+button.secondary { background: #232e3c; color: #cbd5e1; }
+.metrics-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin: 16px 0; }
+.metric { background: #171e28; border: 1px solid #2a3543; border-radius: 12px; padding: 16px; min-height: 92px; }
+.metric span { display: block; color: #8e9aaa; font-size: .72rem; }
+.metric strong { display: block; margin-top: 10px; font-size: 1.4rem; letter-spacing: -.03em; }
+.columns { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.transcript { min-height: 220px; }
+.converted h2 { color: #74e0ab; }
+.empty-state { color: #69778a; border: 1px dashed #344255; border-radius: 9px; padding: 28px 16px; text-align: center; }
+
+@media (max-width: 800px) {
+  .control-grid, .columns { grid-template-columns: 1fr; }
+  .metrics-grid { grid-template-columns: repeat(2, 1fr); }
+}
