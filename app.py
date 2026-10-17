@@ -9,13 +9,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import statistics
+import subprocess
 import tempfile
 import threading
 import queue
 import time
+import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -417,6 +420,45 @@ def summarize_diagnostics(snapshot: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def sample_system_usage() -> dict[str, Any]:
+    """Collect one best-effort process, GPU memory, utilization, and temperature sample."""
+    import psutil
+
+    process = psutil.Process(os.getpid())
+    sample: dict[str, Any] = {
+        "t": time.monotonic(),
+        "cpu_percent": psutil.cpu_percent(interval=None),
+        "process_rss_mb": round(process.memory_info().rss / (1024 * 1024), 2),
+        "gpu_utilization_percent": None,
+        "gpu_vram_used_mb": None,
+        "gpu_vram_total_mb": None,
+        "gpu_temperature_c": None,
+    }
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            sample["gpu_vram_used_mb"] = round(torch.cuda.memory_allocated(0) / (1024 * 1024), 2)
+            sample["gpu_vram_total_mb"] = round(torch.cuda.get_device_properties(0).total_memory / (1024 * 1024), 2)
+    except (ImportError, RuntimeError):
+        pass
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        )
+        fields = [field.strip() for field in result.stdout.split(",", 1)]
+        if result.returncode == 0 and len(fields) == 2:
+            sample["gpu_utilization_percent"] = float(fields[0])
+            sample["gpu_temperature_c"] = float(fields[1])
+    except (FileNotFoundError, OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return sample
+
+
 class SessionRecorder:
     """Collects live audio frames and text events; writes artifacts on stop."""
 
@@ -458,7 +500,7 @@ class LiveSession:
     def __init__(self):
         self.running = False
         self.input_queue: queue.Queue[Any] = queue.Queue(maxsize=256)
-        self.tts_queue: queue.Queue[str] = queue.Queue(maxsize=32)
+        self.tts_queue: queue.Queue[tuple[int, str]] = queue.Queue(maxsize=32)
         self.playback = PlaybackBuffer(max_samples=round(LIVE_PLAYBACK_MAX_S * OUTPUT_RATE))
         self.playback_started = False
         self.playback_underruns = 0
@@ -467,10 +509,65 @@ class LiveSession:
         self.output_stream: Any = None
         self.worker: threading.Thread | None = None
         self.tts_worker: threading.Thread | None = None
+        self.diagnostics_worker: threading.Thread | None = None
         self.hub = EventHub()
         self.stt_model = DEFAULT_STT
         self.recorder: SessionRecorder | None = None
         self.last_recording: dict[str, Any] | None = None
+        self.diagnostics: DiagnosticsSession | None = None
+        self._diagnostics_lock = threading.Lock()
+
+    def begin_diagnostics(self, config: dict[str, Any]) -> None:
+        with self._diagnostics_lock:
+            self.diagnostics = DiagnosticsSession(
+                session_id=uuid.uuid4().hex,
+                started_at=time.monotonic(),
+                config=dict(config),
+            )
+
+    def record_segment_diagnostics(self, segment: SegmentDiagnostics) -> None:
+        with self._diagnostics_lock:
+            if self.diagnostics is not None:
+                self.diagnostics.segments.append(segment)
+
+    def update_segment_diagnostics(self, segment_id: int, section: str, values: dict[str, Any]) -> None:
+        with self._diagnostics_lock:
+            if self.diagnostics is None:
+                return
+            for segment in self.diagnostics.segments:
+                if segment.segment_id == segment_id:
+                    target = getattr(segment, section)
+                    target.update(values)
+                    return
+
+    def diagnostics_time(self) -> float:
+        with self._diagnostics_lock:
+            if self.diagnostics is None:
+                return 0.0
+            return time.monotonic() - self.diagnostics.started_at
+
+    def add_system_sample(self, sample: dict[str, Any]) -> None:
+        with self._diagnostics_lock:
+            if self.diagnostics is not None:
+                self.diagnostics.system_samples.append(dict(sample))
+
+    def diagnostics_snapshot(self) -> dict[str, Any]:
+        with self._diagnostics_lock:
+            if self.diagnostics is None:
+                snapshot = DiagnosticsSession(session_id="", started_at=0.0).to_dict()
+            else:
+                snapshot = self.diagnostics.to_dict()
+        snapshot["counters"].update(
+            {
+                "input_queue_drops": self.dropped_blocks,
+                "tts_queue_depth": self.tts_queue.qsize(),
+                "playback_backlog_s": round(self.playback.samples / OUTPUT_RATE, 3),
+                "playback_drops": self.playback.dropped_frames,
+                "playback_underruns": self.playback_underruns,
+            }
+        )
+        snapshot["summary"] = summarize_diagnostics(snapshot)
+        return snapshot
 
     def start(
         self,
@@ -489,6 +586,17 @@ class LiveSession:
         self.last_recording = None
         self.playback_started = False
         self.playback_underruns = 0
+        self.begin_diagnostics(
+            {
+                "input_device": input_device,
+                "output_device": output_device,
+                "stt_model": stt_model,
+                "input_sample_rate": SAMPLE_RATE,
+                "output_sample_rate": OUTPUT_RATE,
+                "input_block_size": LIVE_BLOCK_SIZE,
+                "output_block_size": 512,
+            }
+        )
 
         def on_input(indata: Any, _frames: int, _timing: Any, _status: Any) -> None:
             try:
@@ -543,11 +651,21 @@ class LiveSession:
         self.input_stream.start()
         self.output_stream.start()
 
+        def diagnostics_worker() -> None:
+            while self.running:
+                self.add_system_sample(sample_system_usage())
+                time.sleep(1.0)
+
+        self.diagnostics_worker = threading.Thread(
+            target=diagnostics_worker, name="audio-cascader-diagnostics", daemon=True
+        )
+        self.diagnostics_worker.start()
+
         def tts_worker() -> None:
             tts = get_pocket_runner()
             while self.running:
                 try:
-                    piece = self.tts_queue.get(timeout=0.2)
+                    segment_id, piece = self.tts_queue.get(timeout=0.2)
                 except queue.Empty:
                     continue
                 if not piece:
@@ -556,14 +674,50 @@ class LiveSession:
                 if self.recorder is not None:
                     self.recorder.add_event("converted", piece)
                 try:
+                    queued_at = self.diagnostics_time()
+                    tts_started = time.monotonic()
+                    tts_started_at = self.diagnostics_time()
+                    first_frame_at: float | None = None
+                    generated_samples = 0
                     # TTS owns a separate model from STT. Keeping it in its
                     # own worker prevents synthesis from stopping microphone
                     # capture and dropping input blocks.
                     for audio in tts.stream(piece):
                         if len(audio):
+                            if first_frame_at is None:
+                                first_frame_at = self.diagnostics_time()
                             self.playback.push(audio)
+                            generated_samples += len(audio)
                             if self.recorder is not None:
                                 self.recorder.add_audio(audio)
+                    finished_at = self.diagnostics_time()
+                    generation_ms = (time.monotonic() - tts_started) * 1000.0
+                    self.update_segment_diagnostics(
+                        segment_id,
+                        "tts",
+                        {
+                            "piece": piece,
+                            "queued_at": queued_at,
+                            "started_at": tts_started_at,
+                            "first_frame_at": first_frame_at,
+                            "finished_at": finished_at,
+                            "generated_audio_duration_s": generated_samples / OUTPUT_RATE,
+                            "generation_ms": round(generation_ms, 3),
+                            "queue_wait_ms": round((tts_started_at - queued_at) * 1000.0, 3),
+                            "real_time_factor": round(
+                                (generated_samples / OUTPUT_RATE) / max(generation_ms / 1000.0, 1e-9), 3
+                            ),
+                        },
+                    )
+                    self.update_segment_diagnostics(
+                        segment_id,
+                        "timings",
+                        {
+                            "tts_first_frame_latency_ms": round(
+                                ((first_frame_at or finished_at) - queued_at) * 1000.0, 3
+                            ),
+                        },
+                    )
                 except Exception as exc:
                     log.exception("TTS worker failed")
                     self.hub.publish({"kind": "error", "error": str(exc)})
@@ -580,10 +734,10 @@ class LiveSession:
             pending: deque[Any] = deque(maxlen=max(1, round(INCREMENTAL_WINDOW_S * SAMPLE_RATE / LIVE_BLOCK_SIZE)))
             last_inference = 0.0
 
-            def emit(text: str) -> None:
+            def emit(text: str, segment_id: int) -> None:
                 for piece in chunk_text(text):
                     try:
-                        self.tts_queue.put_nowait(piece)
+                        self.tts_queue.put_nowait((segment_id, piece))
                     except queue.Full:
                         log.warning("TTS queue full; dropping converted chunk: %s", piece)
 
@@ -598,13 +752,53 @@ class LiveSession:
                         pending.append(block)
                     if finished:
                         for segment in finished:
-                            log.info("Segment %.2f s, level %.3f", len(segment) / SAMPLE_RATE, float(abs(segment).max()) if len(segment) else 0.0)
+                            segment_id = len(self.diagnostics.segments) + 1 if self.diagnostics else 1
+                            segment_started = self.diagnostics_time() - len(segment) / SAMPLE_RATE
+                            segment_ended = self.diagnostics_time()
+                            rms = float(np.sqrt(np.mean(np.square(segment)))) if len(segment) else 0.0
+                            peak = float(abs(segment).max()) if len(segment) else 0.0
+                            self.record_segment_diagnostics(
+                                SegmentDiagnostics(
+                                    segment_id=segment_id,
+                                    started_at=segment_started,
+                                    ended_at=segment_ended,
+                                    endpoint_reason="silence_or_max",
+                                    audio_duration_s=len(segment) / SAMPLE_RATE,
+                                    rms=rms,
+                                    peak=peak,
+                                )
+                            )
+                            log.info("Segment %.2f s, level %.3f", len(segment) / SAMPLE_RATE, peak)
+                            stt_started = time.monotonic()
                             with _GPU_LOCK:
                                 final_text = stt.transcribe(segment)["text"]
-                                self.hub.publish({"kind": "spoken", "text": final_text})
-                                if self.recorder is not None:
-                                    self.recorder.add_event("spoken", final_text)
-                                emit(tracker.flush(final_text))
+                            stt_finished = time.monotonic()
+                            stt_latency_ms = (stt_finished - stt_started) * 1000.0
+                            self.update_segment_diagnostics(
+                                segment_id,
+                                "stt",
+                                {
+                                    "model": stt_model,
+                                    "text": final_text,
+                                    "window_duration_s": len(segment) / SAMPLE_RATE,
+                                    "latency_ms": round(stt_latency_ms, 3),
+                                },
+                            )
+                            stt_finished_at = self.diagnostics_time()
+                            self.update_segment_diagnostics(
+                                segment_id,
+                                "timings",
+                                {
+                                    "stt_latency_ms": round(stt_latency_ms, 3),
+                                    "end_to_end_latency_ms": round(
+                                        (stt_finished_at - segment_started) * 1000.0, 3
+                                    ),
+                                },
+                            )
+                            self.hub.publish({"kind": "spoken", "text": final_text})
+                            if self.recorder is not None:
+                                self.recorder.add_event("spoken", final_text)
+                            emit(tracker.flush(final_text), segment_id)
                         tracker.reset()
                         pending.clear()
                         last_inference = 0.0
@@ -615,11 +809,12 @@ class LiveSession:
                     if len(pending) * LIVE_BLOCK_SIZE < SAMPLE_RATE * 0.6 or now - last_inference < INCREMENTAL_INTERVAL_S:
                         continue
                     window = np.concatenate(tuple(pending)) if pending else np.zeros(0, dtype=np.float32)
+                    stt_started = time.monotonic()
                     with _GPU_LOCK:
                         text = stt.transcribe(window)["text"]
                         new_text = tracker.update(text)
-                        if new_text.strip():
-                            emit(new_text)
+                    if new_text.strip():
+                        emit(new_text, len(self.diagnostics.segments) if self.diagnostics else 1)
                     # Stamp after the call: a slow inference must not reopen the
                     # interval gate immediately and thrash on tiny windows.
                     last_inference = time.monotonic()
@@ -648,6 +843,9 @@ class LiveSession:
         if self.tts_worker is not None:
             self.tts_worker.join(timeout=2.0)
             self.tts_worker = None
+        if self.diagnostics_worker is not None:
+            self.diagnostics_worker.join(timeout=2.0)
+            self.diagnostics_worker = None
         if self.recorder is not None:
             self.last_recording = self.recorder.finalize(ROOT / "outputs", OUTPUT_RATE)
             self.recorder = None
@@ -657,6 +855,9 @@ class LiveSession:
             self.tts_queue.get_nowait()
         self.playback.clear()
         self.playback_started = False
+        with self._diagnostics_lock:
+            if self.diagnostics is not None:
+                self.diagnostics.ended_at = time.monotonic()
         self.hub.publish({"kind": "state", "state": "ready", "recording": self.last_recording})
 
 

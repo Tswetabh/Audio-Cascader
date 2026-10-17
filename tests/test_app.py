@@ -8,6 +8,7 @@ import numpy as np
 from app import (
     EventHub,
     IncrementalTranscriber,
+    LiveSession,
     PlaybackBuffer,
     RmsEndpointDetector,
     SessionRecorder,
@@ -22,6 +23,7 @@ from app import (
     SegmentDiagnostics,
     stable_prefix,
     summarize_diagnostics,
+    sample_system_usage,
     voice_cache_is_current,
 )
 from unittest import mock
@@ -67,6 +69,36 @@ class AppHelpersTests(unittest.TestCase):
         self.assertEqual(summary["stt_latency_ms"]["p50"], 20.0)
         self.assertEqual(summary["stt_latency_ms"]["p95"], 29.0)
         self.assertEqual(summary["end_to_end_latency_ms"]["p50"], 200.0)
+
+    def test_live_session_records_and_returns_diagnostics(self):
+        session = LiveSession()
+        session.begin_diagnostics({"stt_model": "turbo"})
+        session.dropped_blocks = 3
+        session.record_segment_diagnostics(
+            SegmentDiagnostics(
+                segment_id=1,
+                started_at=1.0,
+                ended_at=2.0,
+                timings={"stt_latency_ms": 80.0},
+            )
+        )
+
+        snapshot = session.diagnostics_snapshot()
+
+        self.assertEqual(snapshot["config"]["stt_model"], "turbo")
+        self.assertEqual(snapshot["counters"]["segment_count"], 1)
+        self.assertEqual(snapshot["counters"]["input_queue_drops"], 3)
+        self.assertEqual(snapshot["segments"][0]["timings"]["stt_latency_ms"], 80.0)
+
+    def test_system_sample_has_stable_cpu_memory_and_gpu_fields(self):
+        sample = sample_system_usage()
+
+        self.assertIn("cpu_percent", sample)
+        self.assertIn("process_rss_mb", sample)
+        self.assertIn("gpu_utilization_percent", sample)
+        self.assertIn("gpu_vram_used_mb", sample)
+        self.assertIn("gpu_vram_total_mb", sample)
+        self.assertIn("gpu_temperature_c", sample)
 
     def test_chunk_text_preserves_punctuation_and_word_cap(self):
         self.assertEqual(
