@@ -15,7 +15,7 @@ import tempfile
 import threading
 import queue
 import time
-from dataclasses import dataclass
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -24,6 +24,9 @@ ROOT = Path(__file__).resolve().parent
 SAMPLE_RATE = 16_000
 OUTPUT_RATE = 24_000
 DEFAULT_STT = "turbo"
+INCREMENTAL_INTERVAL_S = 0.6
+INCREMENTAL_WINDOW_S = 10.0
+LIVE_BLOCK_SIZE = 512
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("audio_cascader")
@@ -61,6 +64,47 @@ def stable_prefix(previous: str, current: str) -> str:
     return " ".join(common)
 
 
+class IncrementalTranscriber:
+    """Commits newly stable words across successive transcription passes.
+
+    Feed every partial transcription of the segment to :meth:`update`; it
+    returns only words that stayed unchanged across two consecutive passes and
+    were not emitted yet. At the endpoint, :meth:`flush` releases the
+    remaining tail. :meth:`reset` starts a fresh segment.
+    """
+
+    def __init__(self) -> None:
+        self._last_pass = ""
+        self._emitted_words: list[str] = []
+
+    def update(self, transcription: str) -> str:
+        candidate = stable_prefix(self._last_pass, transcription).split()
+        self._last_pass = transcription
+        emitted = self._emitted_words
+        if candidate[: len(emitted)] != emitted:
+            return ""
+        new_words = candidate[len(emitted) :]
+        if not new_words:
+            return ""
+        self._emitted_words = emitted + new_words
+        return " ".join(new_words)
+
+    def flush(self, transcription: str) -> str:
+        """Release the remaining tail once the segment has ended."""
+        words = transcription.strip().split()
+        emitted = self._emitted_words
+        if words[: len(emitted)] != emitted:
+            return ""
+        new_words = words[len(emitted) :]
+        if new_words:
+            self._emitted_words = emitted + new_words
+        return " ".join(new_words)
+
+    def reset(self) -> None:
+        self._last_pass = ""
+        self._emitted_words = []
+
+
 class RmsEndpointDetector:
     """Small non-neural speech endpoint detector for fixed-size audio blocks."""
 
@@ -72,16 +116,29 @@ class RmsEndpointDetector:
         silence_ms: int = 300,
         min_speech_ms: int = 200,
         max_segment_ms: int = 3500,
+        calibrate_ms: int = 2000,
     ):
         self.sample_rate = sample_rate
         self.block_size = block_size
+        self.min_threshold = threshold
         self.threshold = threshold
         self.silence_blocks = max(1, round(silence_ms * sample_rate / block_size / 1000))
         self.min_samples = round(min_speech_ms * sample_rate / 1000)
         self.max_samples = round(max_segment_ms * sample_rate / 1000)
+        self._calibrate_blocks = round(calibrate_ms * sample_rate / block_size / 1000)
+        self._calibration: list[float] = []
+        self._calibrating = self._calibrate_blocks > 0
         self._blocks: list[Any] = []
         self._samples = 0
         self._silent = 0
+
+    @property
+    def calibrated(self) -> bool:
+        return not self._calibrating
+
+    @property
+    def in_speech(self) -> bool:
+        return bool(self._blocks)
 
     def _reset(self) -> None:
         self._blocks = []
@@ -95,6 +152,13 @@ class RmsEndpointDetector:
         if not len(audio):
             return []
         rms = float(np.sqrt(np.mean(np.square(audio))))
+        if self._calibrating:
+            self._calibration.append(rms)
+            if len(self._calibration) >= self._calibrate_blocks:
+                floor = float(np.median(self._calibration))
+                self.threshold = max(self.min_threshold, floor * 3.0)
+                self._calibrating = False
+            return []
         active = rms >= self.threshold
         if active or self._blocks:
             self._blocks.append(audio)
@@ -171,7 +235,7 @@ class LiveSession:
         self.running = True
         self.input_stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
-            blocksize=512,
+            blocksize=LIVE_BLOCK_SIZE,
             channels=1,
             dtype="float32",
             device=input_device,
@@ -189,23 +253,52 @@ class LiveSession:
         self.output_stream.start()
 
         def worker() -> None:
+            import numpy as np
+
             stt = get_whisper_runner()
             tts = get_pocket_runner()
+            tracker = IncrementalTranscriber()
+            pending: deque[Any] = deque(maxlen=max(1, round(INCREMENTAL_WINDOW_S * SAMPLE_RATE / LIVE_BLOCK_SIZE)))
+            last_inference = 0.0
+
+            def emit(text: str) -> None:
+                for piece in chunk_text(text):
+                    audio = tts.synthesize(piece)
+                    if len(audio):
+                        try:
+                            self.playback.put(audio, timeout=0.5)
+                        except queue.Full:
+                            pass
+
             while self.running:
                 try:
                     block = self.input_queue.get(timeout=0.2)
                 except queue.Empty:
                     continue
-                for segment in detector.push(block):
-                    with _GPU_LOCK:
-                        result = stt.transcribe(segment)
-                        for text in chunk_text(result["text"]):
-                            audio = tts.synthesize(text)
-                            if len(audio):
-                                try:
-                                    self.playback.put(audio, timeout=0.5)
-                                except queue.Full:
-                                    pass
+                finished = detector.push(block)
+                if detector.in_speech:
+                    pending.append(block)
+                if finished:
+                    for segment in finished:
+                        with _GPU_LOCK:
+                            final_text = stt.transcribe(segment)["text"]
+                            emit(tracker.flush(final_text))
+                    tracker.reset()
+                    pending.clear()
+                    last_inference = 0.0
+                    continue
+                now = time.monotonic()
+                if not detector.in_speech or not detector.calibrated:
+                    continue
+                if len(pending) * LIVE_BLOCK_SIZE < SAMPLE_RATE * 0.6 or now - last_inference < INCREMENTAL_INTERVAL_S:
+                    continue
+                window = np.concatenate(tuple(pending)) if pending else np.zeros(0, dtype=np.float32)
+                with _GPU_LOCK:
+                    text = stt.transcribe(window)["text"]
+                    new_text = tracker.update(text)
+                    if new_text.strip():
+                        emit(new_text)
+                last_inference = now
 
         self.worker = threading.Thread(target=worker, name="audio-cascader-live", daemon=True)
         self.worker.start()
