@@ -11,11 +11,13 @@ import json
 import logging
 import re
 import shutil
+import statistics
 import tempfile
 import threading
 import queue
 import time
 from collections import deque
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -348,6 +350,71 @@ class EventHub:
                 channel.put_nowait(event)
             except queue.Full:
                 pass
+
+
+@dataclass
+class SegmentDiagnostics:
+    """JSON-safe timings and measurements for one live speech segment."""
+
+    segment_id: int
+    started_at: float
+    ended_at: float
+    endpoint_reason: str = ""
+    audio_duration_s: float = 0.0
+    rms: float = 0.0
+    peak: float = 0.0
+    stt: dict[str, Any] = field(default_factory=dict)
+    tts: dict[str, Any] = field(default_factory=dict)
+    playback: dict[str, Any] = field(default_factory=dict)
+    timings: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+
+
+@dataclass
+class DiagnosticsSession:
+    """In-memory diagnostics for one session; never writes itself to disk."""
+
+    session_id: str
+    started_at: float
+    ended_at: float | None = None
+    config: dict[str, Any] = field(default_factory=dict)
+    counters: dict[str, Any] = field(default_factory=dict)
+    segments: list[SegmentDiagnostics] = field(default_factory=list)
+    system_samples: list[dict[str, Any]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        counters = dict(payload["counters"])
+        counters["segment_count"] = len(self.segments)
+        counters["system_sample_count"] = len(self.system_samples)
+        payload["counters"] = counters
+        return payload
+
+
+def summarize_diagnostics(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Return robust latency summaries from a diagnostics snapshot."""
+    metrics = ("stt_latency_ms", "tts_first_frame_latency_ms", "end_to_end_latency_ms")
+    result: dict[str, Any] = {}
+    segments = snapshot.get("segments", [])
+    for metric in metrics:
+        values = [
+            float(segment.get("timings", {}).get(metric))
+            for segment in segments
+            if segment.get("timings", {}).get(metric) is not None
+        ]
+        if not values:
+            result[metric] = {"count": 0, "average": None, "p50": None, "p95": None}
+            continue
+        ordered = sorted(values)
+        p95 = ordered[0] if len(ordered) == 1 else statistics.quantiles(ordered, n=100, method="inclusive")[94]
+        result[metric] = {
+            "count": len(values),
+            "average": round(statistics.mean(values), 3),
+            "p50": round(statistics.median(values), 3),
+            "p95": round(p95, 3),
+        }
+    return result
 
 
 class SessionRecorder:

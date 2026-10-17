@@ -18,13 +18,56 @@ from app import (
     create_web_app,
     decode_audio,
     device_extra_settings,
+    DiagnosticsSession,
+    SegmentDiagnostics,
     stable_prefix,
+    summarize_diagnostics,
     voice_cache_is_current,
 )
 from unittest import mock
 
 
 class AppHelpersTests(unittest.TestCase):
+    def test_empty_diagnostics_session_is_json_safe(self):
+        session = DiagnosticsSession(session_id="session-1", started_at=10.0)
+
+        snapshot = session.to_dict()
+
+        self.assertEqual(snapshot["session_id"], "session-1")
+        self.assertEqual(snapshot["segments"], [])
+        self.assertEqual(snapshot["system_samples"], [])
+        self.assertEqual(snapshot["counters"]["segment_count"], 0)
+
+    def test_diagnostics_preserves_segment_order_and_nested_timings(self):
+        session = DiagnosticsSession(session_id="session-1", started_at=10.0)
+        session.segments.extend(
+            [
+                SegmentDiagnostics(segment_id=1, started_at=1.0, ended_at=2.0, stt={"latency_ms": 20.0}),
+                SegmentDiagnostics(segment_id=2, started_at=3.0, ended_at=4.0, stt={"latency_ms": 40.0}),
+            ]
+        )
+
+        snapshot = session.to_dict()
+
+        self.assertEqual([row["segment_id"] for row in snapshot["segments"]], [1, 2])
+        self.assertEqual(snapshot["segments"][1]["stt"]["latency_ms"], 40.0)
+
+    def test_diagnostics_summary_reports_average_p50_and_p95(self):
+        snapshot = {
+            "segments": [
+                {"timings": {"stt_latency_ms": 10.0, "end_to_end_latency_ms": 100.0}},
+                {"timings": {"stt_latency_ms": 20.0, "end_to_end_latency_ms": 200.0}},
+                {"timings": {"stt_latency_ms": 30.0, "end_to_end_latency_ms": 300.0}},
+            ]
+        }
+
+        summary = summarize_diagnostics(snapshot)
+
+        self.assertEqual(summary["stt_latency_ms"]["average"], 20.0)
+        self.assertEqual(summary["stt_latency_ms"]["p50"], 20.0)
+        self.assertEqual(summary["stt_latency_ms"]["p95"], 29.0)
+        self.assertEqual(summary["end_to_end_latency_ms"]["p50"], 200.0)
+
     def test_chunk_text_preserves_punctuation_and_word_cap(self):
         self.assertEqual(
             chunk_text("Hello there. This is a longer sentence with more words", max_words=4),
