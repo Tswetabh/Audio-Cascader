@@ -34,6 +34,7 @@ INCREMENTAL_WINDOW_S = 10.0
 LIVE_BLOCK_SIZE = 512
 PRE_ROLL_MS = 100
 LIVE_PLAYBACK_MAX_S = 4.0
+LIVE_PLAYBACK_PREFILL_S = 0.15
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("audio_cascader")
@@ -249,6 +250,7 @@ class PlaybackBuffer:
         self.samples = 0
         self.dropped_frames = 0
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=capacity)
+        self._pending: Any | None = None
         self._lock = threading.Lock()
 
     def push(self, audio: Any) -> None:
@@ -268,6 +270,11 @@ class PlaybackBuffer:
 
     def pop(self) -> Any | None:
         with self._lock:
+            if self._pending is not None:
+                item = self._pending
+                self._pending = None
+                self.samples -= len(item)
+                return item
             try:
                 item = self._queue.get_nowait()
             except queue.Empty:
@@ -275,8 +282,37 @@ class PlaybackBuffer:
             self.samples -= len(item)
             return item
 
+    def pop_frames(self, count: int) -> Any:
+        """Pop up to ``count`` contiguous samples across queued TTS chunks."""
+        import numpy as np
+
+        if count <= 0:
+            return np.zeros(0, dtype=np.float32)
+        parts: list[Any] = []
+        remaining = count
+        with self._lock:
+            while remaining:
+                if self._pending is not None:
+                    item = self._pending
+                    self._pending = None
+                else:
+                    try:
+                        item = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                take = min(len(item), remaining)
+                if take:
+                    parts.append(item[:take])
+                    self.samples -= take
+                    remaining -= take
+                if take < len(item):
+                    self._pending = item[take:]
+                    break
+        return np.concatenate(parts).astype(np.float32, copy=False) if parts else np.zeros(0, dtype=np.float32)
+
     def clear(self) -> None:
         with self._lock:
+            self._pending = None
             while True:
                 try:
                     self._queue.get_nowait()
@@ -354,12 +390,16 @@ class LiveSession:
 
     def __init__(self):
         self.running = False
-        self.input_queue: queue.Queue[Any] = queue.Queue(maxsize=64)
+        self.input_queue: queue.Queue[Any] = queue.Queue(maxsize=256)
+        self.tts_queue: queue.Queue[str] = queue.Queue(maxsize=32)
         self.playback = PlaybackBuffer(max_samples=round(LIVE_PLAYBACK_MAX_S * OUTPUT_RATE))
+        self.playback_started = False
+        self.playback_underruns = 0
         self.dropped_blocks = 0
         self.input_stream: Any = None
         self.output_stream: Any = None
         self.worker: threading.Thread | None = None
+        self.tts_worker: threading.Thread | None = None
         self.hub = EventHub()
         self.stt_model = DEFAULT_STT
         self.recorder: SessionRecorder | None = None
@@ -380,6 +420,8 @@ class LiveSession:
         self.stt_model = stt_model
         self.recorder = SessionRecorder()
         self.last_recording = None
+        self.playback_started = False
+        self.playback_underruns = 0
 
         def on_input(indata: Any, _frames: int, _timing: Any, _status: Any) -> None:
             try:
@@ -389,13 +431,16 @@ class LiveSession:
 
         def on_output(outdata: Any, _frames: int, _timing: Any, _status: Any) -> None:
             outdata.fill(0)
-            audio = self.playback.pop()
-            if audio is None:
-                return
-            length = min(len(audio), len(outdata))
-            outdata[:length, 0] = audio[:length]
-            if length < len(audio):
-                self.playback.push(audio[length:])
+            if not self.playback_started:
+                if self.playback.samples < round(LIVE_PLAYBACK_PREFILL_S * OUTPUT_RATE):
+                    return
+                self.playback_started = True
+            audio = self.playback.pop_frames(len(outdata))
+            if len(audio):
+                outdata[: len(audio), 0] = audio
+            if len(audio) < len(outdata):
+                self.playback_underruns += 1
+                self.playback_started = False
 
         self.running = True
         # Load both models before opening streams: detector calibration then
@@ -431,25 +476,49 @@ class LiveSession:
         self.input_stream.start()
         self.output_stream.start()
 
+        def tts_worker() -> None:
+            tts = get_pocket_runner()
+            while self.running:
+                try:
+                    piece = self.tts_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if not piece:
+                    continue
+                self.hub.publish({"kind": "converted", "text": piece})
+                if self.recorder is not None:
+                    self.recorder.add_event("converted", piece)
+                try:
+                    # TTS owns a separate model from STT. Keeping it in its
+                    # own worker prevents synthesis from stopping microphone
+                    # capture and dropping input blocks.
+                    for audio in tts.stream(piece):
+                        if len(audio):
+                            self.playback.push(audio)
+                            if self.recorder is not None:
+                                self.recorder.add_audio(audio)
+                except Exception as exc:
+                    log.exception("TTS worker failed")
+                    self.hub.publish({"kind": "error", "error": str(exc)})
+                    self.running = False
+
+        self.tts_worker = threading.Thread(target=tts_worker, name="audio-cascader-tts", daemon=True)
+        self.tts_worker.start()
+
         def worker() -> None:
             import numpy as np
 
             stt = get_whisper_runner(stt_model)
-            tts = get_pocket_runner()
             tracker = IncrementalTranscriber()
             pending: deque[Any] = deque(maxlen=max(1, round(INCREMENTAL_WINDOW_S * SAMPLE_RATE / LIVE_BLOCK_SIZE)))
             last_inference = 0.0
 
             def emit(text: str) -> None:
                 for piece in chunk_text(text):
-                    self.hub.publish({"kind": "converted", "text": piece})
-                    if self.recorder is not None:
-                        self.recorder.add_event("converted", piece)
-                    for audio in tts.stream(piece):
-                        if len(audio):
-                            self.playback.push(audio)
-                            if self.recorder is not None:
-                                self.recorder.add_audio(audio)
+                    try:
+                        self.tts_queue.put_nowait(piece)
+                    except queue.Full:
+                        log.warning("TTS queue full; dropping converted chunk: %s", piece)
 
             try:
                 while self.running:
@@ -509,12 +578,18 @@ class LiveSession:
         if self.worker is not None:
             self.worker.join(timeout=2.0)
             self.worker = None
+        if self.tts_worker is not None:
+            self.tts_worker.join(timeout=2.0)
+            self.tts_worker = None
         if self.recorder is not None:
             self.last_recording = self.recorder.finalize(ROOT / "outputs", OUTPUT_RATE)
             self.recorder = None
         while not self.input_queue.empty():
             self.input_queue.get_nowait()
+        while not self.tts_queue.empty():
+            self.tts_queue.get_nowait()
         self.playback.clear()
+        self.playback_started = False
         self.hub.publish({"kind": "state", "state": "ready", "recording": self.last_recording})
 
 
@@ -833,6 +908,7 @@ def create_web_app() -> Any:
             "queue_drops": session.dropped_blocks,
             "playback_backlog_s": round(session.playback.samples / OUTPUT_RATE, 2),
             "playback_drops": session.playback.dropped_frames,
+            "playback_underruns": session.playback_underruns,
             "recording": session.last_recording,
         }
 

@@ -131,6 +131,17 @@ class AppHelpersTests(unittest.TestCase):
         self.assertEqual(buffer.samples, 0)
         self.assertIsNone(buffer.pop())
 
+    def test_playback_pop_frames_spans_tts_chunks_without_silence(self):
+        buffer = PlaybackBuffer(max_samples=1000)
+        buffer.push(np.ones(3, dtype=np.float32))
+        buffer.push(np.full(3, 2.0, dtype=np.float32))
+
+        first = buffer.pop_frames(5)
+        second = buffer.pop_frames(1)
+
+        np.testing.assert_array_equal(first, np.array([1, 1, 1, 2, 2], dtype=np.float32))
+        np.testing.assert_array_equal(second, np.array([2], dtype=np.float32))
+
     def test_voice_cache_current_only_when_hash_matches(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
