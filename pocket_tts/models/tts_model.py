@@ -452,7 +452,7 @@ class TTSModel(nn.Module):
                 latents_queue.task_done()
 
             # Signal completion
-            if hasattr(self, "_active_generation_timing"):
+            if hasattr(self, "_active_generation_timing") and self._active_generation_timing is not None:
                 self._active_generation_timing["decoder_ms"] = decoder_time * 1000
             result_queue.put(("done", None))
 

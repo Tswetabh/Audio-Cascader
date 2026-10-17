@@ -33,6 +33,13 @@ class FilePipelineSmokeTest(unittest.TestCase):
         self.assertTrue(result["transcript"]["text"].strip(), "transcript must not be empty")
         self.assertGreater(result["output_duration_s"], 0.5, "converted audio is too short")
 
+    def test_pocket_stream_yields_audio_frames(self):
+        from app import get_pocket_runner
+
+        chunks = list(get_pocket_runner().stream("Hello there, this is a streaming test."))
+        self.assertTrue(chunks, "stream must yield at least one chunk")
+        self.assertGreater(sum(len(chunk) for chunk in chunks), 8000, "expected at least ~0.3s of 24kHz audio")
+
 
 if __name__ == "__main__":
     unittest.main()

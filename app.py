@@ -18,7 +18,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterator
 
 ROOT = Path(__file__).resolve().parent
 SAMPLE_RATE = 16_000
@@ -28,6 +28,7 @@ INCREMENTAL_INTERVAL_S = 0.6
 INCREMENTAL_WINDOW_S = 10.0
 LIVE_BLOCK_SIZE = 512
 PRE_ROLL_MS = 100
+LIVE_PLAYBACK_MAX_S = 4.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("audio_cascader")
@@ -203,13 +204,61 @@ def list_audio_devices() -> list[dict[str, Any]]:
     ]
 
 
+class PlaybackBuffer:
+    """FIFO of PCM frames for the output stream with a bounded backlog.
+
+    When the queued audio exceeds ``max_samples``, the oldest frames are
+    dropped so playback never runs far behind live speech.
+    """
+
+    def __init__(self, max_samples: int, capacity: int = 64):
+        self.max_samples = max_samples
+        self.samples = 0
+        self.dropped_frames = 0
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=capacity)
+        self._lock = threading.Lock()
+
+    def push(self, audio: Any) -> None:
+        with self._lock:
+            while self.samples and self.samples + len(audio) > self.max_samples:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                self.samples -= len(item)
+                self.dropped_frames += 1
+            try:
+                self._queue.put_nowait(audio)
+                self.samples += len(audio)
+            except queue.Full:
+                self.dropped_frames += 1
+
+    def pop(self) -> Any | None:
+        with self._lock:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                return None
+            self.samples -= len(item)
+            return item
+
+    def clear(self) -> None:
+        with self._lock:
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            self.samples = 0
+
+
 class LiveSession:
     """Capture microphone blocks, endpoint them, and play converted segments."""
 
     def __init__(self):
         self.running = False
         self.input_queue: queue.Queue[Any] = queue.Queue(maxsize=64)
-        self.playback: queue.Queue[Any] = queue.Queue(maxsize=16)
+        self.playback = PlaybackBuffer(max_samples=round(LIVE_PLAYBACK_MAX_S * OUTPUT_RATE))
         self.dropped_blocks = 0
         self.input_stream: Any = None
         self.output_stream: Any = None
@@ -231,17 +280,13 @@ class LiveSession:
 
         def on_output(outdata: Any, _frames: int, _timing: Any, _status: Any) -> None:
             outdata.fill(0)
-            try:
-                audio = self.playback.get_nowait()
-            except queue.Empty:
+            audio = self.playback.pop()
+            if audio is None:
                 return
             length = min(len(audio), len(outdata))
             outdata[:length, 0] = audio[:length]
             if length < len(audio):
-                try:
-                    self.playback.put_nowait(audio[length:])
-                except queue.Full:
-                    pass
+                self.playback.push(audio[length:])
 
         self.running = True
         self.input_stream = sd.InputStream(
@@ -274,12 +319,9 @@ class LiveSession:
 
             def emit(text: str) -> None:
                 for piece in chunk_text(text):
-                    audio = tts.synthesize(piece)
-                    if len(audio):
-                        try:
-                            self.playback.put(audio, timeout=0.5)
-                        except queue.Full:
-                            pass
+                    for audio in tts.stream(piece):
+                        if len(audio):
+                            self.playback.push(audio)
 
             while self.running:
                 try:
@@ -326,8 +368,7 @@ class LiveSession:
         self.output_stream = None
         while not self.input_queue.empty():
             self.input_queue.get_nowait()
-        while not self.playback.empty():
-            self.playback.get_nowait()
+        self.playback.clear()
 
 
 def require_cuda() -> str:
@@ -492,6 +533,19 @@ class PocketRunner:
         log.info("TTS %.1f ms: %s", (time.perf_counter() - started) * 1000, text)
         return audio
 
+    def stream(self, text: str) -> Iterator[Any]:
+        """Yield generated PCM chunks as soon as the model decodes them."""
+        if not text.strip():
+            return
+        started = time.perf_counter()
+        first = True
+        for chunk in self.load().generate_audio_stream(self.voice_state, text_to_generate=text, copy_state=True):
+            audio = chunk.detach().cpu().numpy()
+            if first:
+                log.info("TTS first frame %.1f ms: %s", (time.perf_counter() - started) * 1000, text)
+                first = False
+            yield audio
+
 
 _GPU_LOCK = threading.RLock()
 _stt_runners: dict[str, WhisperRunner] = {}
@@ -572,6 +626,8 @@ def create_web_app() -> Any:
             "tts_model": "pocket_tts",
             "state": "running" if session.running else "ready",
             "queue_drops": session.dropped_blocks,
+            "playback_backlog_s": round(session.playback.samples / OUTPUT_RATE, 2),
+            "playback_drops": session.playback.dropped_frames,
         }
 
     @web_app.get("/api/devices")

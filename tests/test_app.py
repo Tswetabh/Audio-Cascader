@@ -5,6 +5,7 @@ import numpy as np
 
 from app import (
     IncrementalTranscriber,
+    PlaybackBuffer,
     RmsEndpointDetector,
     chunk_text,
     decode_audio,
@@ -98,6 +99,26 @@ class AppHelpersTests(unittest.TestCase):
         tracker = IncrementalTranscriber()
         self.assertEqual(tracker.update(""), "")
         self.assertEqual(tracker.flush(""), "")
+
+    def test_playback_guard_drops_oldest_frames(self):
+        buffer = PlaybackBuffer(max_samples=100)
+        buffer.push(np.zeros(40, dtype=np.float32))
+        buffer.push(np.ones(40, dtype=np.float32))
+        buffer.push(np.full(40, 2.0, dtype=np.float32))
+        self.assertEqual(buffer.dropped_frames, 1)
+        self.assertEqual(buffer.samples, 80)
+        first = buffer.pop()
+        self.assertEqual(float(first[0]), 1.0)
+        second = buffer.pop()
+        self.assertEqual(float(second[0]), 2.0)
+        self.assertIsNone(buffer.pop())
+
+    def test_playback_clear_resets_backlog(self):
+        buffer = PlaybackBuffer(max_samples=1000)
+        buffer.push(np.zeros(100, dtype=np.float32))
+        buffer.clear()
+        self.assertEqual(buffer.samples, 0)
+        self.assertIsNone(buffer.pop())
 
     def test_decode_audio_missing_file_raises(self):
         with self.assertRaises(FileNotFoundError):
