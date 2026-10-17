@@ -1,17 +1,28 @@
+# Audio Cascader POC — runtime dependencies for app.py + pocket_tts + faster-whisper.
+# Verified against the working .venv on 2026-10-17 (Windows 11, Python 3.12, RTX 3050 6 GB).
+# torch 2.6.0+cu124 lives on the PyTorch index — install with:
+#   .venv\Scripts\python.exe -m pip install -r requirements-gpu.txt ^
+#       --extra-index-url https://download.pytorch.org/whl/cu124
+# Not needed (checked via runtime import closure): torchaudio, librosa, transformers,
+# psutil, qtpy, aiohttp, matplotlib.
+
 torch==2.6.0+cu124
-torchaudio==2.6.0+cu124
 faster-whisper==1.2.1
 ctranslate2==4.8.2
-numpy
-soundfile
-sounddevice
-av
-safetensors
-fastapi
-uvicorn
-python-multipart
-pyyaml
-pydantic
-sentencepiece
-beartype
-huggingface-hub
+tokenizers==0.19.1
+huggingface-hub==0.28.1
+numpy==2.5.4
+scipy==1.17.1
+soundfile==0.12.1
+sounddevice==0.5.6
+av==19.0.1
+safetensors==0.8.0
+einops==0.7.0
+sentencepiece==0.2.2
+beartype==0.22.9
+typing_extensions==4.16.0
+PyYAML==6.0.3
+pydantic==2.13.5
+fastapi==0.142.2
+uvicorn==0.54.0
+python-multipart==0.0.32

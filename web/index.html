@@ -5,33 +5,77 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Audio Cascader</title>
   <style>
-    body { max-width: 720px; margin: 3rem auto; padding: 0 1rem; font: 16px system-ui, sans-serif; }
-    button { padding: .6rem 1rem; cursor: pointer; }
-    pre { background: #f1f3f5; padding: 1rem; overflow: auto; }
-    #result { white-space: pre-wrap; }
+    :root { color-scheme: light dark; }
+    body { max-width: 860px; margin: 2rem auto; padding: 0 1rem; font: 15px/1.5 system-ui, sans-serif; }
+    h1 { font-size: 1.4rem; margin-bottom: .25rem; }
+    #meta { color: #888; margin-top: 0; font-size: .85rem; }
+    section { border: 1px solid #8884; border-radius: 8px; padding: .8rem 1rem; margin: 1rem 0; }
+    label { display: inline-block; margin-right: 1rem; font-size: .9rem; }
+    select { max-width: 320px; }
+    button { padding: .45rem .9rem; cursor: pointer; margin-right: .5rem; }
+    .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .col h3 { margin: 0 0 .4rem; font-size: .85rem; text-transform: uppercase; color: #888; }
+    .lines { min-height: 120px; max-height: 260px; overflow-y: auto; border: 1px solid #8883; border-radius: 6px; padding: .4rem .6rem; font-size: .95rem; }
+    .lines p { margin: .25rem 0; }
+    .spoken { color: #888; }
+    .converted { color: #3d9970; font-weight: 600; }
+    .err { color: #e05252; }
+    #stats { font-size: .8rem; color: #888; }
+    pre { background: #8882; padding: .6rem; border-radius: 6px; overflow: auto; max-height: 240px; }
   </style>
 </head>
 <body>
   <h1>Audio Cascader</h1>
-  <p id="status">Checking CUDA status…</p>
+  <p id="meta">Checking status…</p>
+
   <section>
     <label>Microphone <select id="input"></select></label>
     <label>Output <select id="output"></select></label>
-    <button id="start" type="button">Start live</button>
-    <button id="stop" type="button">Stop</button>
+    <label>STT <select id="stt">
+      <option value="turbo" selected>turbo (best)</option>
+      <option value="tiny">tiny (fast fallback)</option>
+    </select></label>
+    <p>
+      <button id="start" type="button">Start live</button>
+      <button id="stop" type="button">Stop</button>
+    </p>
+    <p id="stats">backlog 0.0s · drops 0 · recorded —</p>
   </section>
-  <hr>
-  <form id="form">
-    <input id="audio" type="file" accept="audio/*" required>
-    <button>Convert</button>
-  </form>
-  <pre id="result"></pre>
+
+  <section>
+    <div class="cols">
+      <div class="col"><h3>Spoken (final STT)</h3><div class="lines" id="spoken"></div></div>
+      <div class="col"><h3>Converted (sent to TTS)</h3><div class="lines" id="converted"></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h3>File mode</h3>
+    <form id="form">
+      <input id="audio" type="file" accept="audio/*" required>
+      <button>Convert</button>
+    </form>
+    <pre id="result"></pre>
+  </section>
+
   <script>
-    const status = document.querySelector('#status');
+    const meta = document.querySelector('#meta');
+    const stats = document.querySelector('#stats');
+    const spoken = document.querySelector('#spoken');
+    const converted = document.querySelector('#converted');
     const result = document.querySelector('#result');
-    fetch('/api/status').then(r => r.json()).then(s => {
-      status.textContent = s.gpu ? `GPU: ${s.gpu} · STT: ${s.stt_model} · TTS: ${s.tts_model}` : 'CUDA unavailable';
-    });
+
+    function refreshStatus() {
+      fetch('/api/status').then(r => r.json()).then(s => {
+        const gpu = s.gpu || 'CUDA unavailable';
+        meta.textContent = `${gpu} · STT ${s.stt_model} · TTS ${s.tts_model} · ${s.state}`;
+        const rec = s.recording ? s.recording.wav.split(/[\\/]/).pop() : '—';
+        stats.textContent = `backlog ${Number(s.playback_backlog_s).toFixed(1)}s · drops ${s.queue_drops}/${s.playback_drops} · recorded ${rec}`;
+      });
+    }
+    refreshStatus();
+    setInterval(refreshStatus, 2000);
+
     fetch('/api/devices').then(r => r.json()).then(devices => {
       const input = document.querySelector('#input');
       const output = document.querySelector('#output');
@@ -40,16 +84,42 @@
         if (device.outputs) output.add(new Option(`${device.index}: ${device.name}`, device.index));
       });
     });
+
     document.querySelector('#start').addEventListener('click', async () => {
       const input = document.querySelector('#input').value;
       const output = document.querySelector('#output').value;
-      const response = await fetch(`/api/start?input_device=${input}&output_device=${output}`, { method: 'POST' });
-      result.textContent = JSON.stringify(await response.json(), null, 2);
+      const stt = document.querySelector('#stt').value;
+      spoken.innerHTML = ''; converted.innerHTML = '';
+      const response = await fetch(`/api/start?input_device=${input}&output_device=${output}&stt_model=${stt}`, { method: 'POST' });
+      const body = await response.json();
+      if (!response.ok) append(spoken, 'error: ' + body.detail, 'err');
+      refreshStatus();
     });
+
     document.querySelector('#stop').addEventListener('click', async () => {
       const response = await fetch('/api/stop', { method: 'POST' });
-      result.textContent = JSON.stringify(await response.json(), null, 2);
+      const body = await response.json();
+      result.textContent = JSON.stringify(body, null, 2);
+      refreshStatus();
     });
+
+    function append(container, text, cls) {
+      const line = document.createElement('p');
+      line.textContent = text;
+      if (cls) line.className = cls;
+      container.appendChild(line);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    const events = new EventSource('/api/events');
+    events.onmessage = event => {
+      const data = JSON.parse(event.data);
+      if (data.kind === 'spoken') append(spoken, data.text, 'spoken');
+      else if (data.kind === 'converted') append(converted, data.text, 'converted');
+      else if (data.kind === 'error') append(spoken, 'error: ' + data.error, 'err');
+      else if (data.kind === 'state') refreshStatus();
+    };
+
     document.querySelector('#form').addEventListener('submit', async event => {
       event.preventDefault();
       const data = new FormData();

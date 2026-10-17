@@ -252,6 +252,70 @@ class PlaybackBuffer:
             self.samples = 0
 
 
+class EventHub:
+    """Fan-out of JSON-serializable events to SSE subscribers."""
+
+    def __init__(self, capacity: int = 256):
+        self.capacity = capacity
+        self._subscribers: list[queue.Queue[Any]] = []
+        self._lock = threading.Lock()
+
+    def subscribe(self) -> queue.Queue[Any]:
+        channel: queue.Queue[Any] = queue.Queue(maxsize=self.capacity)
+        with self._lock:
+            self._subscribers.append(channel)
+        return channel
+
+    def unsubscribe(self, channel: queue.Queue[Any]) -> None:
+        with self._lock:
+            if channel in self._subscribers:
+                self._subscribers.remove(channel)
+
+    def publish(self, event: dict[str, Any]) -> None:
+        with self._lock:
+            subscribers = list(self._subscribers)
+        for channel in subscribers:
+            try:
+                channel.put_nowait(event)
+            except queue.Full:
+                pass
+
+
+class SessionRecorder:
+    """Collects live audio frames and text events; writes artifacts on stop."""
+
+    def __init__(self) -> None:
+        self.audio: list[Any] = []
+        self.events: list[dict[str, Any]] = []
+        self.started = time.monotonic()
+
+    def add_audio(self, frame: Any) -> None:
+        if len(frame):
+            self.audio.append(frame)
+
+    def add_event(self, kind: str, text: str) -> None:
+        self.events.append({"t": round(time.monotonic() - self.started, 3), "kind": kind, "text": text})
+
+    def finalize(self, output_dir: Path, sample_rate: int) -> dict[str, Any]:
+        import numpy as np
+        import soundfile as sf
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        audio = np.concatenate(self.audio) if self.audio else np.zeros(0, dtype=np.float32)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        wav_path = output_dir / f"live_{stamp}.wav"
+        metrics_path = output_dir / f"live_{stamp}_metrics.json"
+        sf.write(str(wav_path), audio, sample_rate, subtype="PCM_16")
+        metrics = {
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "duration_s": round(len(audio) / sample_rate, 3),
+            "sample_rate": sample_rate,
+            "events": self.events,
+        }
+        metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        return {"wav": str(wav_path), "metrics": str(metrics_path), "duration_s": metrics["duration_s"]}
+
+
 class LiveSession:
     """Capture microphone blocks, endpoint them, and play converted segments."""
 
@@ -263,14 +327,26 @@ class LiveSession:
         self.input_stream: Any = None
         self.output_stream: Any = None
         self.worker: threading.Thread | None = None
+        self.hub = EventHub()
+        self.stt_model = DEFAULT_STT
+        self.recorder: SessionRecorder | None = None
+        self.last_recording: dict[str, Any] | None = None
 
-    def start(self, input_device: int | None = None, output_device: int | None = None) -> None:
+    def start(
+        self,
+        input_device: int | None = None,
+        output_device: int | None = None,
+        stt_model: str = DEFAULT_STT,
+    ) -> None:
         import sounddevice as sd
 
         if self.running:
             return
         require_cuda()
         detector = RmsEndpointDetector()
+        self.stt_model = stt_model
+        self.recorder = SessionRecorder()
+        self.last_recording = None
 
         def on_input(indata: Any, _frames: int, _timing: Any, _status: Any) -> None:
             try:
@@ -311,7 +387,7 @@ class LiveSession:
         def worker() -> None:
             import numpy as np
 
-            stt = get_whisper_runner()
+            stt = get_whisper_runner(stt_model)
             tts = get_pocket_runner()
             tracker = IncrementalTranscriber()
             pending: deque[Any] = deque(maxlen=max(1, round(INCREMENTAL_WINDOW_S * SAMPLE_RATE / LIVE_BLOCK_SIZE)))
@@ -319,42 +395,56 @@ class LiveSession:
 
             def emit(text: str) -> None:
                 for piece in chunk_text(text):
+                    self.hub.publish({"kind": "converted", "text": piece})
+                    if self.recorder is not None:
+                        self.recorder.add_event("converted", piece)
                     for audio in tts.stream(piece):
                         if len(audio):
                             self.playback.push(audio)
+                            if self.recorder is not None:
+                                self.recorder.add_audio(audio)
 
-            while self.running:
-                try:
-                    block = self.input_queue.get(timeout=0.2)
-                except queue.Empty:
-                    continue
-                finished = detector.push(block)
-                if detector.in_speech:
-                    pending.append(block)
-                if finished:
-                    for segment in finished:
-                        with _GPU_LOCK:
-                            final_text = stt.transcribe(segment)["text"]
-                            emit(tracker.flush(final_text))
-                    tracker.reset()
-                    pending.clear()
-                    last_inference = 0.0
-                    continue
-                now = time.monotonic()
-                if not detector.in_speech or not detector.calibrated:
-                    continue
-                if len(pending) * LIVE_BLOCK_SIZE < SAMPLE_RATE * 0.6 or now - last_inference < INCREMENTAL_INTERVAL_S:
-                    continue
-                window = np.concatenate(tuple(pending)) if pending else np.zeros(0, dtype=np.float32)
-                with _GPU_LOCK:
-                    text = stt.transcribe(window)["text"]
-                    new_text = tracker.update(text)
-                    if new_text.strip():
-                        emit(new_text)
-                last_inference = now
+            try:
+                while self.running:
+                    try:
+                        block = self.input_queue.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    finished = detector.push(block)
+                    if detector.in_speech:
+                        pending.append(block)
+                    if finished:
+                        for segment in finished:
+                            with _GPU_LOCK:
+                                final_text = stt.transcribe(segment)["text"]
+                                self.hub.publish({"kind": "spoken", "text": final_text})
+                                if self.recorder is not None:
+                                    self.recorder.add_event("spoken", final_text)
+                                emit(tracker.flush(final_text))
+                        tracker.reset()
+                        pending.clear()
+                        last_inference = 0.0
+                        continue
+                    now = time.monotonic()
+                    if not detector.in_speech or not detector.calibrated:
+                        continue
+                    if len(pending) * LIVE_BLOCK_SIZE < SAMPLE_RATE * 0.6 or now - last_inference < INCREMENTAL_INTERVAL_S:
+                        continue
+                    window = np.concatenate(tuple(pending)) if pending else np.zeros(0, dtype=np.float32)
+                    with _GPU_LOCK:
+                        text = stt.transcribe(window)["text"]
+                        new_text = tracker.update(text)
+                        if new_text.strip():
+                            emit(new_text)
+                    last_inference = now
+            except Exception as exc:
+                log.exception("Live worker failed")
+                self.hub.publish({"kind": "error", "error": str(exc)})
+                self.running = False
 
         self.worker = threading.Thread(target=worker, name="audio-cascader-live", daemon=True)
         self.worker.start()
+        self.hub.publish({"kind": "state", "state": "running", "stt_model": stt_model})
 
     def stop(self) -> None:
         self.running = False
@@ -366,9 +456,16 @@ class LiveSession:
             self.output_stream.close()
         self.input_stream = None
         self.output_stream = None
+        if self.worker is not None:
+            self.worker.join(timeout=2.0)
+            self.worker = None
+        if self.recorder is not None:
+            self.last_recording = self.recorder.finalize(ROOT / "outputs", OUTPUT_RATE)
+            self.recorder = None
         while not self.input_queue.empty():
             self.input_queue.get_nowait()
         self.playback.clear()
+        self.hub.publish({"kind": "state", "state": "ready", "recording": self.last_recording})
 
 
 def require_cuda() -> str:
@@ -631,12 +728,13 @@ def create_web_app() -> Any:
             gpu = None
         return {
             "gpu": gpu,
-            "stt_model": DEFAULT_STT,
+            "stt_model": session.stt_model,
             "tts_model": "pocket_tts",
             "state": "running" if session.running else "ready",
             "queue_drops": session.dropped_blocks,
             "playback_backlog_s": round(session.playback.samples / OUTPUT_RATE, 2),
             "playback_drops": session.playback.dropped_frames,
+            "recording": session.last_recording,
         }
 
     @web_app.get("/api/devices")
@@ -647,10 +745,16 @@ def create_web_app() -> Any:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @web_app.post("/api/start")
-    def start(input_device: int | None = None, output_device: int | None = None) -> dict[str, Any]:
+    def start(
+        input_device: int | None = None,
+        output_device: int | None = None,
+        stt_model: str = DEFAULT_STT,
+    ) -> dict[str, Any]:
+        if stt_model not in ("turbo", "tiny"):
+            raise HTTPException(status_code=400, detail=f"Unknown STT model: {stt_model}")
         try:
-            session.start(input_device=input_device, output_device=output_device)
-            return {"state": "running"}
+            session.start(input_device=input_device, output_device=output_device, stt_model=stt_model)
+            return {"state": "running", "stt_model": stt_model}
         except (ImportError, OSError, RuntimeError, ValueError) as exc:
             session.stop()
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -658,7 +762,26 @@ def create_web_app() -> Any:
     @web_app.post("/api/stop")
     def stop() -> dict[str, Any]:
         session.stop()
-        return {"state": "ready"}
+        return {"state": "ready", "recording": session.last_recording}
+
+    @web_app.get("/api/events")
+    def events() -> Any:
+        from fastapi.responses import StreamingResponse
+
+        def generate() -> Iterator[str]:
+            channel = session.hub.subscribe()
+            try:
+                while True:
+                    try:
+                        event = channel.get(timeout=15)
+                    except queue.Empty:
+                        yield ": keepalive\n\n"
+                        continue
+                    yield f"data: {json.dumps(event)}\n\n"
+            finally:
+                session.hub.unsubscribe(channel)
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
 
     @web_app.post("/api/process")
     async def process(upload: UploadFile = File(...)) -> dict[str, Any]:
