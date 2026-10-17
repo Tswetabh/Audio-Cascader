@@ -1,5 +1,9 @@
 # Audio Cascader — Comprehensive Line-by-Line Code Walkthrough
 
+> **Stale (2026-10-17): pre-simplification walkthrough.** Describes the
+> Gen-1/Gen-2 hybrid code that has been superseded by `app.py` +
+> `web/index.html`. Kept for reference only.
+
 This document breaks down every script and module in the project line by line. It avoids abstract jargon and focuses directly on what the code does, why each statement is written, and how data moves through the pipeline.
 
 ---

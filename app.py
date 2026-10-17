@@ -415,6 +415,7 @@ class LiveSession:
                         pending.append(block)
                     if finished:
                         for segment in finished:
+                            log.info("Segment %.2f s, level %.3f", len(segment) / SAMPLE_RATE, float(abs(segment).max()) if len(segment) else 0.0)
                             with _GPU_LOCK:
                                 final_text = stt.transcribe(segment)["text"]
                                 self.hub.publish({"kind": "spoken", "text": final_text})

@@ -1,5 +1,10 @@
 # Technical Handoff — TTS POC → Audio Cascader
 
+> **Stale (2026-10-17): historical pre-simplification audit.** The active
+> application is now `app.py` + `web/index.html`; this document describes the
+> Gen-1/Gen-2 hybrid it replaced. Kept for reference; the full old tree is
+> recoverable from the freeze commit.
+
 > Audience: an independent reviewing AI with **no filesystem access** and no prior conversation.
 > Scope: documentation and investigation only. No code was changed to produce this file.
 > Claim labels used throughout: `Verified` (read in source or measured this session),
