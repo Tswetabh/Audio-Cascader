@@ -1188,6 +1188,44 @@ def create_web_app() -> Any:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @web_app.get("/api/output")
+    def output_file(path: str) -> Any:
+        output_root = (ROOT / "outputs").resolve()
+        candidate = Path(path).expanduser().resolve()
+        if output_root not in candidate.parents or not candidate.is_file():
+            raise HTTPException(status_code=404, detail="Output file not found")
+        return FileResponse(candidate, media_type="audio/wav", filename=candidate.name)
+
+    @web_app.get("/api/voice-reference")
+    def voice_reference() -> Any:
+        reference = PocketRunner().reference_path
+        if not reference.is_file():
+            raise HTTPException(status_code=404, detail="Reference voice not found")
+        return FileResponse(reference, media_type="audio/wav", filename=reference.name)
+
+    @web_app.post("/api/synthesize")
+    def synthesize(payload: dict[str, Any]) -> dict[str, Any]:
+        import numpy as np
+        import soundfile as sf
+
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="text is required")
+        started = time.perf_counter()
+        with _GPU_LOCK:
+            audio = get_pocket_runner().synthesize(text)
+        output_dir = ROOT / "outputs"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = output_dir / f"synthesized_{stamp}.wav"
+        sf.write(str(output_path), np.asarray(audio, dtype=np.float32), OUTPUT_RATE, subtype="PCM_16")
+        return {
+            "output": str(output_path),
+            "text": text,
+            "duration_s": round(len(audio) / OUTPUT_RATE, 3),
+            "latency_ms": round((time.perf_counter() - started) * 1000.0, 1),
+        }
+
     @web_app.get("/api/status")
     def status() -> dict[str, Any]:
         try:

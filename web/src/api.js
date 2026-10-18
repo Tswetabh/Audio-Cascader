@@ -13,7 +13,19 @@ export const startLive = (input, output, stt) => request(
   { method: 'POST' },
 );
 export const stopLive = () => request('/api/stop', { method: 'POST' });
+export const processAudio = (file) => {
+  const form = new FormData();
+  form.append('upload', file);
+  return request('/api/process', { method: 'POST', body: form });
+};
+export const synthesizeText = (text) => request('/api/synthesize', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ text }),
+});
 export const exportUrl = (format) => `/api/diagnostics/export?format=${format}`;
+export const outputUrl = (path) => `/api/output?path=${encodeURIComponent(path || '')}`;
+export const voiceReferenceUrl = () => '/api/voice-reference';
 export const subscribeToEvents = (onEvent, onError) => {
   const source = new EventSource('/api/events');
   source.onmessage = (event) => onEvent(JSON.parse(event.data));

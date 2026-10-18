@@ -395,6 +395,24 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_output_endpoint_serves_generated_audio_only_from_outputs(self):
+        output = next(Path("outputs").glob("*.wav"))
+
+        response = self._client().get("/api/output", params={"path": str(output.resolve())})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("audio/wav"))
+
+    def test_output_endpoint_rejects_paths_outside_outputs(self):
+        response = self._client().get("/api/output", params={"path": str(Path("README.md").resolve())})
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_synthesize_endpoint_rejects_empty_text(self):
+        response = self._client().post("/api/synthesize", json={"text": "   "})
+
+        self.assertEqual(response.status_code, 400)
+
     def test_decode_audio_garbage_file_raises_value_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             bad = Path(tmp) / "bad.wav"
