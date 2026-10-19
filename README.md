@@ -99,6 +99,23 @@ pip install faster-whisper ctranslate2 soundfile sounddevice silero-vad av libro
 
 ## Usage
 
+### 0. Web diagnostics app (recommended)
+
+Build the React frontend once, then launch the local FastAPI server:
+
+```bat
+cd web
+npm install
+npm run build
+cd ..
+run_app.bat
+```
+
+Open `http://127.0.0.1:8000`. The diagnostics dashboard shows per-segment
+capture/STT/TTS/playback timings, queue drops, underruns, CPU/GPU samples, and
+device warnings. Diagnostics remain in memory and are downloaded only when the
+user clicks **Download JSON** or **Download CSV**.
+
 ### 1. File mode (CLI)
 
 ```bat

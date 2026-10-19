@@ -21,6 +21,7 @@ einops==0.7.0
 sentencepiece==0.2.2
 beartype==0.22.9
 typing_extensions==4.16.0
+psutil==7.2.2
 PyYAML==6.0.3
 pydantic==2.13.5
 fastapi==0.142.2

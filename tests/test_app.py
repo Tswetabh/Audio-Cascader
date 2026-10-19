@@ -8,6 +8,7 @@ import numpy as np
 from app import (
     EventHub,
     IncrementalTranscriber,
+    LiveSession,
     PlaybackBuffer,
     RmsEndpointDetector,
     SessionRecorder,
@@ -18,13 +19,89 @@ from app import (
     create_web_app,
     decode_audio,
     device_extra_settings,
+    DiagnosticsSession,
+    SegmentDiagnostics,
     stable_prefix,
+    summarize_diagnostics,
+    sample_system_usage,
     voice_cache_is_current,
 )
 from unittest import mock
 
 
 class AppHelpersTests(unittest.TestCase):
+    def test_empty_diagnostics_session_is_json_safe(self):
+        session = DiagnosticsSession(session_id="session-1", started_at=10.0)
+
+        snapshot = session.to_dict()
+
+        self.assertEqual(snapshot["session_id"], "session-1")
+        self.assertEqual(snapshot["segments"], [])
+        self.assertEqual(snapshot["system_samples"], [])
+        self.assertEqual(snapshot["counters"]["segment_count"], 0)
+
+    def test_diagnostics_preserves_segment_order_and_nested_timings(self):
+        session = DiagnosticsSession(session_id="session-1", started_at=10.0)
+        session.segments.extend(
+            [
+                SegmentDiagnostics(segment_id=1, started_at=1.0, ended_at=2.0, stt={"latency_ms": 20.0}),
+                SegmentDiagnostics(segment_id=2, started_at=3.0, ended_at=4.0, stt={"latency_ms": 40.0}),
+            ]
+        )
+
+        snapshot = session.to_dict()
+
+        self.assertEqual([row["segment_id"] for row in snapshot["segments"]], [1, 2])
+        self.assertEqual(snapshot["segments"][1]["stt"]["latency_ms"], 40.0)
+
+    def test_diagnostics_summary_reports_average_p50_and_p95(self):
+        snapshot = {
+            "segments": [
+                {"timings": {"stt_latency_ms": 10.0, "end_to_end_latency_ms": 100.0}},
+                {"timings": {"stt_latency_ms": 20.0, "end_to_end_latency_ms": 200.0}},
+                {"timings": {"stt_latency_ms": 30.0, "end_to_end_latency_ms": 300.0}},
+            ]
+        }
+
+        summary = summarize_diagnostics(snapshot)
+
+        self.assertEqual(summary["stt_latency_ms"]["average"], 20.0)
+        self.assertEqual(summary["stt_latency_ms"]["p50"], 20.0)
+        self.assertEqual(summary["stt_latency_ms"]["p95"], 29.0)
+        self.assertEqual(summary["end_to_end_latency_ms"]["p50"], 200.0)
+
+    def test_live_session_records_and_returns_diagnostics(self):
+        session = LiveSession()
+        session.begin_diagnostics({"stt_model": "turbo"})
+        session.dropped_blocks = 3
+        session.record_segment_diagnostics(
+            SegmentDiagnostics(
+                segment_id=1,
+                started_at=1.0,
+                ended_at=2.0,
+                timings={"stt_latency_ms": 80.0},
+            )
+        )
+        session.update_segment_diagnostics(1, "timings", {"end_to_end_latency_ms": 123.0})
+
+        snapshot = session.diagnostics_snapshot()
+
+        self.assertEqual(snapshot["config"]["stt_model"], "turbo")
+        self.assertEqual(snapshot["counters"]["segment_count"], 1)
+        self.assertEqual(snapshot["counters"]["input_queue_drops"], 3)
+        self.assertEqual(snapshot["segments"][0]["timings"]["stt_latency_ms"], 80.0)
+        self.assertEqual(snapshot["segments"][0]["timings"]["end_to_end_latency_ms"], 123.0)
+
+    def test_system_sample_has_stable_cpu_memory_and_gpu_fields(self):
+        sample = sample_system_usage()
+
+        self.assertIn("cpu_percent", sample)
+        self.assertIn("process_rss_mb", sample)
+        self.assertIn("gpu_utilization_percent", sample)
+        self.assertIn("gpu_vram_used_mb", sample)
+        self.assertIn("gpu_vram_total_mb", sample)
+        self.assertIn("gpu_temperature_c", sample)
+
     def test_chunk_text_preserves_punctuation_and_word_cap(self):
         self.assertEqual(
             chunk_text("Hello there. This is a longer sentence with more words", max_words=4),
@@ -267,6 +344,20 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
 
+    def test_react_frontend_serves_from_production_build(self):
+        response = self._client().get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('id="root"', response.text)
+
+    def test_missing_react_build_explains_how_to_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("app.ROOT", Path(tmp)):
+                response = self._client().get("/")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("npm run build", response.text)
+
     def test_process_upload_rejects_garbage_with_400(self):
         # Regression: `from __future__ import annotations` stringifies the
         # /api/process signature; FastAPI must be able to resolve UploadFile,
@@ -277,6 +368,50 @@ class WebAppTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertNotIn("PydanticUserError", response.text)
+
+    def test_diagnostics_endpoint_returns_empty_snapshot(self):
+        response = self._client().get("/api/diagnostics")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["segments"], [])
+        self.assertIn("summary", response.json())
+
+    def test_diagnostics_json_export_is_an_explicit_download(self):
+        response = self._client().get("/api/diagnostics/export?format=json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("attachment", response.headers["content-disposition"])
+        self.assertEqual(response.json()["segments"], [])
+
+    def test_diagnostics_csv_export_has_stable_headers(self):
+        response = self._client().get("/api/diagnostics/export?format=csv")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("segment_id", response.text.splitlines()[0])
+        self.assertIn("attachment", response.headers["content-disposition"])
+
+    def test_diagnostics_export_rejects_unknown_format(self):
+        response = self._client().get("/api/diagnostics/export?format=xml")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_output_endpoint_serves_generated_audio_only_from_outputs(self):
+        output = next(Path("outputs").glob("*.wav"))
+
+        response = self._client().get("/api/output", params={"path": str(output.resolve())})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("audio/wav"))
+
+    def test_output_endpoint_rejects_paths_outside_outputs(self):
+        response = self._client().get("/api/output", params={"path": str(Path("README.md").resolve())})
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_synthesize_endpoint_rejects_empty_text(self):
+        response = self._client().post("/api/synthesize", json={"text": "   "})
+
+        self.assertEqual(response.status_code, 400)
 
     def test_decode_audio_garbage_file_raises_value_error(self):
         with tempfile.TemporaryDirectory() as tmp:
