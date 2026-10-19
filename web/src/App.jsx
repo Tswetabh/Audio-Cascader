@@ -12,6 +12,7 @@ import {
   synthesizeText,
   voiceReferenceUrl,
 } from './api.js';
+import { getInitialTheme, saveTheme } from './theme.js';
 
 const emptyDiagnostics = { segments: [], system_samples: [], counters: {}, summary: {} };
 
@@ -32,6 +33,14 @@ function download(format) {
   link.remove();
 }
 
+function readTheme() {
+  if (typeof window === 'undefined') return 'dark';
+  return getInitialTheme(
+    window.localStorage,
+    window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? true,
+  );
+}
+
 function DeviceSelect({ label, devices, value, onChange, inputOnly = false }) {
   return <label>{label}<select value={value} onChange={(event) => onChange(event.target.value)}>
     {devices.filter((device) => inputOnly ? device.inputs : device.outputs).map((device) => (
@@ -44,6 +53,7 @@ function DeviceSelect({ label, devices, value, onChange, inputOnly = false }) {
 
 export default function App() {
   const [mode, setMode] = useState('batch');
+  const [theme, setTheme] = useState(readTheme);
   const [status, setStatus] = useState({ state: 'ready', stt_model: 'turbo', tts_model: 'pocket_tts' });
   const [diagnostics, setDiagnostics] = useState(emptyDiagnostics);
   const [devices, setDevices] = useState([]);
@@ -61,6 +71,11 @@ export default function App() {
   const [showDiagnostics, setShowDiagnostics] = useState(true);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [error, setError] = useState('');
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    saveTheme(window.localStorage, theme);
+  }, [theme]);
 
   const refresh = useCallback(async () => {
     try {
@@ -125,6 +140,7 @@ export default function App() {
       setTranscript(result.transcript?.text || '');
       setOutputMeta(result);
       setOutputAudio(outputUrl(result.output));
+      setDiagnostics((current) => ({ ...current, batch: { last_conversion: result } }));
     } catch (cause) { setError(cause.message); }
     finally { setBusy(false); }
   }
@@ -155,13 +171,14 @@ export default function App() {
 
   const counters = diagnostics.counters || {};
   const latestSample = diagnostics.system_samples?.at(-1);
+  const batch = diagnostics.batch?.last_conversion;
   const live = status.state === 'running';
 
   return (
     <main className="app-shell">
       <header className="topbar">
         <div className="brand"><div className="brand-mark">AC</div><div><p className="eyebrow">S2S VOICE & ACCENT STUDIO</p><h1>Audio Cascader</h1><p className="muted">Speech-to-speech workspace</p></div></div>
-        <div className="header-status"><span className={`status-dot ${live ? 'live' : 'ready'}`} />{live ? 'Live capture active' : 'Ready'}<span className="cuda-badge">{status.gpu ? 'CUDA ready' : 'CUDA unavailable'}</span><button className="icon-button" title="Settings and diagnostics" onClick={() => setShowAdvanced((value) => !value)}>⚙</button></div>
+        <div className="header-status"><span className={`status-dot ${live ? 'live' : 'ready'}`} />{live ? 'Live capture active' : 'Ready'}<span className="cuda-badge">{status.gpu ? 'CUDA ready' : 'CUDA unavailable'}</span><button className="theme-toggle" type="button" onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}><span aria-hidden="true">{theme === 'dark' ? '☀' : '☾'}</span>{theme === 'dark' ? 'Light mode' : 'Dark mode'}</button><button className="icon-button" title="Settings and diagnostics" onClick={() => setShowAdvanced((value) => !value)}>⚙</button></div>
       </header>
 
       {error && <div className="alert error">{error}</div>}
@@ -206,10 +223,11 @@ export default function App() {
 
         <section className="right-column">
           <article className="panel transcript-panel"><div className="section-heading"><div><p className="eyebrow">TRANSCRIPTION</p><h2>Editable transcript</h2></div><span className="small-status">{spoken.length} live events</span></div><textarea value={transcript} onChange={(event) => setTranscript(event.target.value)} placeholder="Transcribed speech will appear here. Edit it, then synthesize the revised text." /><div className="transcript-history">{spoken.length ? spoken.map((text, index) => <span key={`${index}-${text}`}>{text}</span>) : <span className="muted">No live transcript yet.</span>}</div></article>
-          <article className="panel output-panel"><div className="section-heading"><div><p className="eyebrow">GENERATED AUDIO</p><h2>Output result</h2></div><span className={`small-status ${outputAudio ? 'success' : ''}`}>{outputAudio ? 'Ready to play' : 'Awaiting conversion'}</span></div>{outputAudio ? <><audio controls src={outputAudio} className="full-audio output-audio" /><div className="output-meta"><span>{outputMeta?.output?.split(/[\\/]/).pop() || 'Live recording'}</span><span>{outputMeta?.duration_s ? `${outputMeta.duration_s}s` : 'Browser playback'}</span></div></> : <div className="empty-state">Convert speech to preview the generated voice here.</div>}</article>
+           <article className="panel output-panel"><div className="section-heading"><div><p className="eyebrow">GENERATED AUDIO</p><h2>Output result</h2></div><span className={`small-status ${outputAudio ? 'success' : ''}`}>{outputAudio ? 'Ready to play' : 'Awaiting conversion'}</span></div>{outputAudio ? <><audio controls src={outputAudio} className="full-audio output-audio" /><div className="output-meta"><span>{outputMeta?.output?.split(/[\\/]/).pop() || 'Live recording'}</span><span>{(outputMeta?.duration_s ?? outputMeta?.output_duration_s) != null ? `${outputMeta.duration_s ?? outputMeta.output_duration_s}s` : 'Browser playback'}</span></div></> : <div className="empty-state">Convert speech to preview the generated voice here.</div>}</article>
           <article className="panel converted-panel"><div className="section-heading"><div><p className="eyebrow">LIVE OUTPUT</p><h2>Converted speech</h2></div><span className="small-status">{converted.length} chunks</span></div><div className="lines">{converted.length ? converted.map((text, index) => <p key={`${index}-${text}`}>{text}</p>) : <div className="empty-state compact">Live converted text will appear here.</div>}</div></article>
-        </section>
-      </section>
+         </section>
+       {batch && <section className="panel batch-diagnostic"><div className="section-heading"><div><p className="eyebrow">LATEST FILE CONVERSION</p><h2>{batch.input?.split(/[\\/]/).pop() || 'Uploaded audio'}</h2></div><span className="small-status success">Measured</span></div><div className="metrics-grid"><Metric label="Decode" value={batch.decode_ms} unit=" ms" /><Metric label="STT" value={batch.stt_ms} unit=" ms" /><Metric label="Chunking" value={batch.chunk_ms} unit=" ms" /><Metric label="TTS" value={batch.tts_ms} unit=" ms" /><Metric label="Write" value={batch.write_ms} unit=" ms" /><Metric label="Total" value={batch.end_to_end_latency_ms} unit=" ms" tone={batch.end_to_end_latency_ms > 6000 ? 'bad' : ''} /></div></section>}
+       </section>
 
       <details className="diagnostics panel" open={showDiagnostics} onToggle={(event) => setShowDiagnostics(event.currentTarget.open)}><summary><span><p className="eyebrow">DIAGNOSTICS</p><h2>Pipeline telemetry & benchmark data</h2></span><span className="summary-actions"><button className="secondary-action" onClick={(event) => { event.preventDefault(); download('json'); }}>Download JSON</button><button className="secondary-action" onClick={(event) => { event.preventDefault(); download('csv'); }}>Download CSV</button></span></summary><div className="diagnostic-content"><section className="metrics-grid"><Metric label="STT latency · avg" value={average(diagnostics.summary, 'stt_latency_ms')} unit=" ms" /><Metric label="STT latency · p95" value={diagnostics.summary?.stt_latency_ms?.p95} unit=" ms" /><Metric label="TTS first frame" value={average(diagnostics.summary, 'tts_first_frame_latency_ms')} unit=" ms" /><Metric label="End-to-end · p95" value={diagnostics.summary?.end_to_end_latency_ms?.p95} unit=" ms" /><Metric label="Input drops" value={counters.input_queue_drops ?? 0} tone={counters.input_queue_drops ? 'bad' : ''} /><Metric label="Playback underruns" value={counters.playback_underruns ?? 0} tone={counters.playback_underruns ? 'bad' : ''} /></section><div className="table-wrap"><table><thead><tr><th>ID</th><th>Audio</th><th>STT</th><th>TTS first</th><th>End-to-end</th><th>Text</th></tr></thead><tbody>{diagnostics.segments?.map((segment) => <tr key={segment.segment_id}><td>{segment.segment_id}</td><td>{Number(segment.audio_duration_s || 0).toFixed(2)} s</td><td>{segment.stt?.latency_ms ?? '—'} ms</td><td>{segment.timings?.tts_first_frame_latency_ms ?? '—'} ms</td><td>{segment.timings?.end_to_end_latency_ms ?? '—'} ms</td><td>{segment.stt?.text || '—'}</td></tr>)}</tbody></table></div><div className="system-grid"><Metric label="CPU" value={latestSample?.cpu_percent} unit="%" /><Metric label="Process RAM" value={latestSample?.process_rss_mb} unit=" MB" /><Metric label="GPU utilization" value={latestSample?.gpu_utilization_percent} unit="%" /><Metric label="GPU VRAM" value={latestSample?.gpu_vram_used_mb} unit=" MB" /><Metric label="TTS queue" value={counters.tts_queue_depth ?? 0} /><Metric label="Backlog" value={counters.playback_backlog_s} unit=" s" /></div><p className="route-note">Input: {inputDevice ? `${inputDevice.name} [${inputDevice.host_api}]` : '—'} · Output: {outputDevice ? `${outputDevice.name} [${outputDevice.host_api}]` : '—'} · GPU: {status.gpu || '—'}</p></div></details>
     </main>

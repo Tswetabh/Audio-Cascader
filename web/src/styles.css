@@ -19,6 +19,25 @@
   --error: #FF7D86;
 }
 
+:root[data-theme="light"] {
+  color: #18202B;
+  background: #F4F7FB;
+  --app: #F4F7FB;
+  --panel: #FFFFFF;
+  --elevated: #F0F4F8;
+  --inset: #F8FAFC;
+  --border: #D5DEE9;
+  --text: #18202B;
+  --secondary: #526174;
+  --muted: #738196;
+  --blue: #2563EB;
+  --blue-hover: #1D4ED8;
+  --active: #1D4ED8;
+  --success: #16805A;
+  --warning: #9A6500;
+  --error: #B42336;
+}
+
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; background: var(--app); }
 button, input, select, textarea { font: inherit; }
@@ -44,6 +63,8 @@ h2 { color: var(--text); font-size: 16px; line-height: 1.2; letter-spacing: -.01
 .cuda-badge, .small-status { border: 1px solid var(--border); border-radius: 999px; padding: 4px 8px; color: var(--secondary); font-size: 10px; }
 .cuda-badge { color: var(--success); border-color: #286e57; }
 .small-status.success { color: var(--success); border-color: #286e57; }
+.theme-toggle { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; padding: 0 10px; border: 1px solid var(--border); border-radius: 999px; color: var(--secondary); background: var(--panel); font-size: 11px; }
+.theme-toggle:hover { color: var(--text); border-color: var(--active); }
 .icon-button { width: 30px; height: 30px; padding: 0; border: 1px solid var(--border); border-radius: 6px; color: var(--secondary); background: var(--panel); }
 .icon-button:hover { color: var(--text); border-color: var(--active); }
 
@@ -57,6 +78,8 @@ h2 { color: var(--text); font-size: 16px; line-height: 1.2; letter-spacing: -.01
 .mode-tab.active { color: var(--active); border-bottom-color: var(--blue); }
 
 .workspace { display: grid; grid-template-columns: minmax(320px, .82fr) minmax(480px, 1.45fr); gap: 16px; align-items: start; }
+.batch-diagnostic { grid-column: 1 / -1; padding: 18px; }
+.batch-diagnostic .metrics-grid { margin-bottom: 0; }
 .left-column { padding: 18px; }
 .right-column { display: grid; gap: 16px; }
 .section-heading { margin-bottom: 16px; }

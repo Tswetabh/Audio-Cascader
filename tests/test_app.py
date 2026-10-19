@@ -350,6 +350,30 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('id="root"', response.text)
 
+    def test_diagnostics_includes_latest_batch_conversion(self):
+        fake_result = {
+            "output": Path("outputs/converted_test.wav"),
+            "metrics": Path("outputs/converted_test_metrics.json"),
+            "transcript": {"text": "hello"},
+            "converted_text": ["hello"],
+            "output_duration_s": 1.2,
+            "decode_ms": 12.0,
+            "stt_ms": 240.0,
+            "tts_ms": 780.0,
+            "write_ms": 4.0,
+            "end_to_end_latency_ms": 1036.0,
+        }
+        with mock.patch("app.process_file", return_value=fake_result):
+            response = self._client().post(
+                "/api/process",
+                files={"upload": ("input.wav", b"fake audio", "audio/wav")},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        diagnostics = self._client().get("/api/diagnostics").json()
+        self.assertEqual(diagnostics["batch"]["last_conversion"]["end_to_end_latency_ms"], 1036.0)
+        self.assertEqual(diagnostics["batch"]["last_conversion"]["tts_ms"], 780.0)
+
     def test_missing_react_build_explains_how_to_build(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch("app.ROOT", Path(tmp)):

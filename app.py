@@ -1109,6 +1109,7 @@ class PocketRunner:
 _GPU_LOCK = threading.RLock()
 _stt_runners: dict[str, WhisperRunner] = {}
 _tts_runner: PocketRunner | None = None
+_last_batch_metrics: dict[str, Any] | None = None
 
 
 def get_whisper_runner(model_name: str = DEFAULT_STT) -> WhisperRunner:
@@ -1136,17 +1137,27 @@ def process_file(input_path: Path, output_dir: Path | None = None, model_name: s
     output_dir = output_dir or ROOT / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
+    decode_started = time.perf_counter()
     audio = decode_audio(input_path)
+    decode_ms = (time.perf_counter() - decode_started) * 1000.0
     with _GPU_LOCK:
+        stt_started = time.perf_counter()
         transcript = get_whisper_runner(model_name).transcribe(audio)
+        stt_ms = (time.perf_counter() - stt_started) * 1000.0
+        chunk_started = time.perf_counter()
         texts = chunk_text(transcript["text"])
+        chunk_ms = (time.perf_counter() - chunk_started) * 1000.0
+        tts_started = time.perf_counter()
         tts = get_pocket_runner()
         rendered = [tts.synthesize(text) for text in texts]
+        tts_ms = (time.perf_counter() - tts_started) * 1000.0
     output = np.concatenate(rendered) if rendered else np.zeros(0, dtype=np.float32)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = output_dir / f"converted_{stamp}.wav"
     metrics_path = output_dir / f"converted_{stamp}_metrics.json"
+    write_started = time.perf_counter()
     sf.write(str(output_path), output, OUTPUT_RATE, subtype="PCM_16")
+    write_ms = (time.perf_counter() - write_started) * 1000.0
     metrics = {
         "gpu": require_cuda(),
         "input": str(input_path),
@@ -1154,9 +1165,16 @@ def process_file(input_path: Path, output_dir: Path | None = None, model_name: s
         "converted_text": texts,
         "output": str(output_path),
         "output_duration_s": round(len(output) / OUTPUT_RATE, 3),
+        "decode_ms": round(decode_ms, 1),
+        "stt_ms": round(stt_ms, 1),
+        "chunk_ms": round(chunk_ms, 1),
+        "tts_ms": round(tts_ms, 1),
+        "write_ms": round(write_ms, 1),
         "end_to_end_latency_ms": round((time.perf_counter() - started) * 1000, 1),
     }
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    global _last_batch_metrics
+    _last_batch_metrics = json.loads(json.dumps(metrics, default=str))
     return {"output": output_path, "metrics": metrics_path, **metrics}
 
 
@@ -1248,7 +1266,9 @@ def create_web_app() -> Any:
 
     @web_app.get("/api/diagnostics")
     def diagnostics() -> dict[str, Any]:
-        return session.diagnostics_snapshot()
+        snapshot = session.diagnostics_snapshot()
+        snapshot["batch"] = {"last_conversion": _last_batch_metrics}
+        return snapshot
 
     @web_app.get("/api/diagnostics/export")
     def export_diagnostics(format: str = "json") -> Response:
@@ -1360,9 +1380,11 @@ def create_web_app() -> Any:
         suffix = Path(upload.filename or "input.wav").suffix or ".wav"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
             shutil.copyfileobj(upload.file, temporary)
-            temporary_path = Path(temporary.name)
+        temporary_path = Path(temporary.name)
         try:
             result = process_file(temporary_path)
+            global _last_batch_metrics
+            _last_batch_metrics = json.loads(json.dumps(result, default=str))
             return {key: str(value) if isinstance(value, Path) else value for key, value in result.items()}
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
